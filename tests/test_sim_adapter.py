@@ -38,7 +38,7 @@ def test_walk_forward(duck: MujocoMicroduckAdapter) -> None:
     duck.move(vx=0.30)
 
     for _ in range(100):
-        duck.step(0.02)
+        duck.step()
 
     duck.stop()
     end = duck.state()
@@ -49,11 +49,11 @@ def test_walk_forward(duck: MujocoMicroduckAdapter) -> None:
 def test_stop(duck: MujocoMicroduckAdapter) -> None:
     duck.move(vx=0.30)
     for _ in range(50):
-        duck.step(0.02)
+        duck.step()
 
     duck.stop()
     for _ in range(50):
-        duck.step(0.02)
+        duck.step()
 
     assert abs(duck.state().linear_velocity[0]) < 0.05
 
@@ -65,7 +65,7 @@ def test_turn(duck: MujocoMicroduckAdapter) -> None:
     duck.move(vx=0.0, vyaw=1.2)
 
     for _ in range(100):
-        duck.step(0.02)
+        duck.step()
 
     duck.stop()
     end_yaw = duck.state().yaw

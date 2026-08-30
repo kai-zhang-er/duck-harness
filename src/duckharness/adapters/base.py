@@ -23,8 +23,8 @@ class RobotAdapter(Protocol):
     def stop(self) -> None:
         """Command the robot to stop."""
 
-    def step(self, dt: float) -> None:
-        """Advance the adapter's control/simulation loop by ``dt`` seconds."""
+    def step(self) -> None:
+        """Advance the adapter by one control period."""
 
     def state(self) -> RobotState:
         """Return the latest robot state."""

@@ -95,8 +95,6 @@ class MujocoMicroduckAdapter:
         self.fallen_height = float(fallen_height)
         self.command = np.zeros(13, dtype=np.float32)
         self.last_action = np.zeros(ACTION_SIZE, dtype=np.float32)
-        self._sim_time_remainder = 0.0
-        self._steps_until_policy = 0
 
         self._trunk_qpos_adr, self._trunk_qvel_adr = self._find_freejoint(
             "trunk_base_freejoint"
@@ -146,33 +144,16 @@ class MujocoMicroduckAdapter:
 
         self.move(0.0, 0.0, 0.0)
 
-    def step(self, dt: float) -> None:
-        """Advance simulation by approximately ``dt`` seconds.
+    def step(self) -> None:
+        """Advance one 50 Hz control period.
 
-        MuJoCo advances in fixed-size increments. A small remainder is carried
-        to the next call, so callers may use a control-loop period such as
-        ``0.02`` while the underlying simulation remains at 5 ms.
+        One policy action is computed from the current observation, then held
+        across ``decimation`` MuJoCo steps at the fixed simulation timestep.
         """
 
-        if not math.isfinite(dt) or dt <= 0.0:
-            raise ValueError("dt must be a finite, positive number")
-
-        self._sim_time_remainder += float(dt)
-        microsteps = int(
-            math.floor(
-                (self._sim_time_remainder + self.simulation_timestep * 1e-9)
-                / self.simulation_timestep
-            )
-        )
-        self._sim_time_remainder -= microsteps * self.simulation_timestep
-
-        for _ in range(microsteps):
-            if self._steps_until_policy == 0:
-                self._apply_policy_action()
-                self._steps_until_policy = self.decimation
-
+        self._apply_policy_action()
+        for _ in range(self.decimation):
             mujoco.mj_step(self.model, self.data)
-            self._steps_until_policy -= 1
 
     def state(self) -> RobotState:
         """Return ground-truth base pose and world-frame linear velocity."""
