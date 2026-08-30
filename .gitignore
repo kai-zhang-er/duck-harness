@@ -1,0 +1,44 @@
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Build and packaging output
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Test and coverage output
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Local environment and tool files
+.env
+.env.*
+!.env.example
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# Editor and IDE settings
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Operating-system metadata
+.DS_Store
+._*
+Thumbs.db

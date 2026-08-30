@@ -1,0 +1,25 @@
+[build-system]
+requires = ["uv_build>=0.8.19,<0.9.0"]
+build-backend = "uv_build"
+
+[project]
+name = "duckharness"
+version = "0.2.0"
+description = "High-level interfaces for MicroDuck simulation and robot adapters"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "mujoco>=3.10.0",
+    "numpy>=2.0.0",
+    "onnxruntime>=1.24.4",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+src = ["src"]
