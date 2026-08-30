@@ -1,0 +1,12 @@
+<mujoco model="duckharness_navigation">
+    <!-- Keep the upstream robot model untouched; this scene only adds a floor
+         and a visual, non-colliding target body for ground-truth navigation. -->
+    <include file="../../../microduck_rl/src/mjlab_microduck/robot/microduck/scene.xml" />
+    <compiler meshdir="../../../microduck_rl/src/mjlab_microduck/robot/microduck/assets" angle="radian" autolimits="true" />
+
+    <worldbody>
+        <body name="red_ball" pos="0.6 0.6 0.05">
+            <geom name="red_ball_visual" type="sphere" size="0.05" rgba="1 0 0 1" contype="0" conaffinity="0" />
+        </body>
+    </worldbody>
+</mujoco>
