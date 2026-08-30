@@ -144,6 +144,12 @@ class MujocoMicroduckAdapter:
 
         self.move(0.0, 0.0, 0.0)
 
+    @property
+    def control_dt(self) -> float:
+        """Duration of one policy/control period in seconds."""
+
+        return self.control_timestep
+
     def step(self) -> None:
         """Advance one 50 Hz control period.
 

@@ -23,6 +23,10 @@ class RobotAdapter(Protocol):
     def stop(self) -> None:
         """Command the robot to stop."""
 
+    @property
+    def control_dt(self) -> float:
+        """Duration of one control period in seconds."""
+
     def step(self) -> None:
         """Advance the adapter by one control period."""
 
