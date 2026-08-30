@@ -10,7 +10,7 @@ import mujoco
 import numpy as np
 import onnxruntime as ort
 
-from .base import RobotState
+from .base import CameraFrame, RobotState
 
 
 # These values match the validated walking runtime in microduck_rl/scripts/
@@ -58,12 +58,17 @@ class MujocoMicroduckAdapter:
         fallen_height: float = 0.06,
         simulation_timestep: float = SIMULATION_TIMESTEP,
         control_frequency: float = CONTROL_FREQUENCY,
+        camera_name: str = "head_camera",
+        image_width: int = 640,
+        image_height: int = 480,
         session_options: ort.SessionOptions | None = None,
     ) -> None:
         if simulation_timestep <= 0.0:
             raise ValueError("simulation_timestep must be positive")
         if control_frequency <= 0.0:
             raise ValueError("control_frequency must be positive")
+        if image_width <= 0 or image_height <= 0:
+            raise ValueError("image_width and image_height must be positive")
 
         self.model_path = Path(model_path)
         self.walking_policy_path = Path(walking_policy_path)
@@ -120,6 +125,20 @@ class MujocoMicroduckAdapter:
             )
         self.default_pose = DEFAULT_POSE.copy()
 
+        self.camera_name = camera_name
+        camera_id = mujoco.mj_name2id(
+            self.model,
+            mujoco.mjtObj.mjOBJ_CAMERA,
+            camera_name,
+        )
+        if camera_id < 0:
+            raise ValueError(f"Required MuJoCo camera {camera_name!r} not found")
+        self.image_width = int(image_width)
+        self.image_height = int(image_height)
+        # Renderer creation needs a graphics connection on macOS. Keep it
+        # lazy so headless physics/control users do not need a display.
+        self._renderer: mujoco.Renderer | None = None
+
         self.policy = ort.InferenceSession(
             str(self.walking_policy_path), sess_options=session_options
         )
@@ -130,6 +149,8 @@ class MujocoMicroduckAdapter:
         self._validate_policy_shape(policy_input.shape, policy_output.shape)
 
         self._reset_to_default_pose()
+        if self.camera_name == "head_camera":
+            self._orient_head_camera_forward()
 
     def move(self, vx: float, vy: float = 0.0, vyaw: float = 0.0) -> None:
         """Set a body-frame velocity command without advancing simulation."""
@@ -149,6 +170,12 @@ class MujocoMicroduckAdapter:
         """Duration of one policy/control period in seconds."""
 
         return self.control_timestep
+
+    @property
+    def sim_time(self) -> float:
+        """Current MuJoCo simulation time in seconds."""
+
+        return float(self.data.time)
 
     def step(self) -> None:
         """Advance one 50 Hz control period.
@@ -186,6 +213,44 @@ class MujocoMicroduckAdapter:
             linear_velocity=tuple(float(value) for value in linear_velocity),
             fallen=bool(position[2] < self.fallen_height),
         )
+
+    def get_camera_frame(self, camera: str = "head") -> CameraFrame:
+        """Render an RGB frame without advancing physics.
+
+        ``head`` is the stable cross-backend name. A concrete MuJoCo camera
+        name is also accepted for simulation-specific cameras.
+        """
+
+        if camera == "head":
+            concrete_name = self.camera_name
+        else:
+            concrete_name = camera
+            camera_id = mujoco.mj_name2id(
+                self.model,
+                mujoco.mjtObj.mjOBJ_CAMERA,
+                concrete_name,
+            )
+            if camera_id < 0:
+                raise ValueError(f"MuJoCo camera {camera!r} not found")
+
+        if self._renderer is None:
+            self._renderer = mujoco.Renderer(
+                self.model,
+                height=self.image_height,
+                width=self.image_width,
+            )
+        self._renderer.update_scene(self.data, camera=concrete_name)
+        rgb = self._renderer.render().copy()
+        return CameraFrame(
+            rgb=rgb,
+            timestamp=float(self.data.time),
+            camera_name=concrete_name,
+        )
+
+    def get_rgb(self, camera: str = "head") -> np.ndarray:
+        """Return a copied RGB array as a convenience API."""
+
+        return self.get_camera_frame(camera).rgb
 
     def _apply_policy_action(self) -> None:
         observation = self._observation().reshape(1, OBSERVATION_SIZE)
@@ -247,6 +312,38 @@ class MujocoMicroduckAdapter:
             self.data.qpos[qpos_index] = self.default_pose[index]
         self.data.qvel[:] = 0.0
         self.data.ctrl[:] = self.default_pose
+        mujoco.mj_forward(self.model, self.data)
+
+    def _orient_head_camera_forward(self) -> None:
+        """Aim the existing head-mounted camera along the robot's +X axis.
+
+        The upstream camera is correctly attached to the moving head body but
+        its authored optical axis points backward for this deployment scene.
+        Reorienting only the camera's local frame preserves the attachment and
+        makes the stable ``head`` API a forward-facing first-person view.
+        """
+
+        camera_id = self._name_id(
+            mujoco.mjtObj.mjOBJ_CAMERA,
+            self.camera_name,
+        )
+        parent_id = int(self.model.cam_bodyid[camera_id])
+        parent_rotation = self.data.xmat[parent_id].reshape(3, 3)
+
+        # Camera convention: optical axis is local -Z and image up is local Y.
+        # At the default pose, use world +X as forward and world +Z as up.
+        desired_world_rotation = np.array(
+            [
+                [0.0, 0.0, -1.0],
+                [-1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        local_rotation = parent_rotation.T @ desired_world_rotation
+        local_quaternion = np.zeros(4, dtype=np.float64)
+        mujoco.mju_mat2Quat(local_quaternion, local_rotation.reshape(-1))
+        self.model.cam_quat[camera_id] = local_quaternion
         mujoco.mj_forward(self.model, self.data)
 
     def _find_freejoint(self, name: str) -> tuple[int, int]:

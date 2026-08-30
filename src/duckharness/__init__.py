@@ -1,5 +1,5 @@
 """DuckHarness: shared high-level interfaces for robot adapters."""
 
-from .adapters.base import RobotAdapter, RobotState
+from .adapters.base import CameraFrame, RobotAdapter, RobotState
 
-__all__ = ["RobotAdapter", "RobotState"]
+__all__ = ["CameraFrame", "RobotAdapter", "RobotState"]

@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from typing import Protocol
 
+import numpy as np
+
 
 @dataclass(frozen=True)
 class RobotState:
@@ -12,6 +14,15 @@ class RobotState:
     yaw: float
     linear_velocity: tuple[float, float, float]
     fallen: bool
+
+
+@dataclass(frozen=True)
+class CameraFrame:
+    """An RGB camera capture with simulation time metadata."""
+
+    rgb: np.ndarray
+    timestamp: float
+    camera_name: str
 
 
 class RobotAdapter(Protocol):
@@ -27,8 +38,15 @@ class RobotAdapter(Protocol):
     def control_dt(self) -> float:
         """Duration of one control period in seconds."""
 
+    @property
+    def sim_time(self) -> float:
+        """Current simulation time in seconds, when available."""
+
     def step(self) -> None:
         """Advance the adapter by one control period."""
 
     def state(self) -> RobotState:
         """Return the latest robot state."""
+
+    def get_camera_frame(self, camera: str = "head") -> CameraFrame:
+        """Capture an RGB frame from a named camera."""

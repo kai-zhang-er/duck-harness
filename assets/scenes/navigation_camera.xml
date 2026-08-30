@@ -1,0 +1,14 @@
+<mujoco model="duckharness_navigation_camera">
+    <!-- The upstream robot model already contains the head-mounted
+         `head_camera`; this scene adds only a larger visual landmark. -->
+    <include file="../../../microduck_rl/src/mjlab_microduck/robot/microduck/scene.xml" />
+    <!-- MuJoCo resolves the included robot's mesh paths relative to the
+         top-level model. Keep this compiler after the include. -->
+    <compiler meshdir="../../../microduck_rl/src/mjlab_microduck/robot/microduck/assets" angle="radian" autolimits="true" />
+
+    <worldbody>
+        <body name="red_ball" pos="1.0 0.4 0.08">
+            <geom name="red_ball_visual" type="sphere" size="0.08" rgba="1 0 0 1" contype="0" conaffinity="0" />
+        </body>
+    </worldbody>
+</mujoco>

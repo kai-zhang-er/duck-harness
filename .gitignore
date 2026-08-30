@@ -22,6 +22,7 @@ pip-wheel-metadata/
 .coverage.*
 htmlcov/
 coverage.xml
+frames/
 
 # Local environment and tool files
 .env
