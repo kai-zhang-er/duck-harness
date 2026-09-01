@@ -2,5 +2,12 @@
 
 from .red_ball import RedBallDetector, draw_detection
 from .types import Detection
+from .viewpoints import Viewpoint, ViewpointManager
 
-__all__ = ["Detection", "RedBallDetector", "draw_detection"]
+__all__ = [
+    "Detection",
+    "RedBallDetector",
+    "Viewpoint",
+    "ViewpointManager",
+    "draw_detection",
+]

@@ -66,6 +66,9 @@ with mujoco.viewer.launch_passive(robot.model, robot.data) as viewer:
         yaw_kp=1.20,
         yaw_sign=-1.0,
         min_align_yaw_rate=1.0,
+        # Camera/proprioception jitter can keep the target just outside the
+        # tighter generic threshold; allow stable tracking to enter approach.
+        centered_threshold=0.20,
         # ``area_ratio`` is the bounding-box area in the image. A larger
         # threshold makes the duck approach closer before stopping.
         stop_area_ratio=0.3,
@@ -90,6 +93,7 @@ with mujoco.viewer.launch_passive(robot.model, robot.data) as viewer:
         f"Recoveries: {result.evidence['recovery_count']} | "
         f"Trace entries: {len(result.trace)} | "
         f"Final center_x: {result.evidence.get('center_x')} | "
+        f"Final center_y: {result.evidence.get('center_y')} | "
         f"Final area_ratio: {result.evidence.get('area_ratio')}"
     )
 

@@ -39,6 +39,11 @@ OBSERVATION_SIZE = 61
 ACTION_SIZE = 14
 SIMULATION_TIMESTEP = 0.005
 CONTROL_FREQUENCY = 50.0
+VIRTUAL_CAMERA_PITCHES = {
+    "head_forward": 0.0,
+    "head_down_20": -math.radians(20.0),
+    "head_down_35": -math.radians(35.0),
+}
 
 
 class MujocoMicroduckAdapter:
@@ -133,6 +138,8 @@ class MujocoMicroduckAdapter:
         )
         if camera_id < 0:
             raise ValueError(f"Required MuJoCo camera {camera_name!r} not found")
+        self._camera_id = int(camera_id)
+        self._head_camera_base_local_rotation: np.ndarray | None = None
         self.image_width = int(image_width)
         self.image_height = int(image_height)
         # Renderer creation needs a graphics connection on macOS. Keep it
@@ -217,14 +224,29 @@ class MujocoMicroduckAdapter:
     def get_camera_frame(self, camera: str = "head") -> CameraFrame:
         """Render an RGB frame without advancing physics.
 
-        ``head`` is the stable cross-backend name. A concrete MuJoCo camera
-        name is also accepted for simulation-specific cameras.
+        ``head`` and ``head_forward`` are aliases for the default camera.
+        ``head_down_20`` and ``head_down_35`` are virtual views that keep the
+        same head-mounted camera position but tilt its optical axis downward.
+        A concrete MuJoCo camera name is also accepted for simulation-specific
+        cameras. Selecting a view never advances physics.
         """
 
         if camera == "head":
             concrete_name = self.camera_name
+            frame_name = concrete_name
+            if self.camera_name == "head_camera":
+                self._set_head_camera_pitch(0.0)
+        elif camera in VIRTUAL_CAMERA_PITCHES:
+            if self.camera_name != "head_camera":
+                raise ValueError(
+                    "virtual head camera views require camera_name='head_camera'"
+                )
+            concrete_name = self.camera_name
+            frame_name = camera
+            self._set_head_camera_pitch(VIRTUAL_CAMERA_PITCHES[camera])
         else:
             concrete_name = camera
+            frame_name = concrete_name
             camera_id = mujoco.mj_name2id(
                 self.model,
                 mujoco.mjtObj.mjOBJ_CAMERA,
@@ -232,6 +254,8 @@ class MujocoMicroduckAdapter:
             )
             if camera_id < 0:
                 raise ValueError(f"MuJoCo camera {camera!r} not found")
+            if concrete_name == self.camera_name and self.camera_name == "head_camera":
+                self._set_head_camera_pitch(0.0)
 
         if self._renderer is None:
             self._renderer = mujoco.Renderer(
@@ -244,7 +268,7 @@ class MujocoMicroduckAdapter:
         return CameraFrame(
             rgb=rgb,
             timestamp=float(self.data.time),
-            camera_name=concrete_name,
+            camera_name=frame_name,
         )
 
     def get_rgb(self, camera: str = "head") -> np.ndarray:
@@ -323,15 +347,14 @@ class MujocoMicroduckAdapter:
         makes the stable ``head`` API a forward-facing first-person view.
         """
 
-        camera_id = self._name_id(
-            mujoco.mjtObj.mjOBJ_CAMERA,
-            self.camera_name,
-        )
+        camera_id = self._camera_id
         parent_id = int(self.model.cam_bodyid[camera_id])
         parent_rotation = self.data.xmat[parent_id].reshape(3, 3)
 
-        # Camera convention: optical axis is local -Z and image up is local Y.
-        # At the default pose, use world +X as forward and world +Z as up.
+        # MuJoCo cameras look along local -Z and use local +Y as image up.
+        # Express a forward-facing camera in the head body's local frame once;
+        # retaining this local transform lets the camera follow the head and
+        # trunk when the robot turns.
         desired_world_rotation = np.array(
             [
                 [0.0, 0.0, -1.0],
@@ -340,7 +363,29 @@ class MujocoMicroduckAdapter:
             ],
             dtype=np.float64,
         )
-        local_rotation = parent_rotation.T @ desired_world_rotation
+        self._head_camera_base_local_rotation = (
+            parent_rotation.T @ desired_world_rotation
+        )
+        self._set_head_camera_pitch(0.0)
+
+    def _set_head_camera_pitch(self, pitch: float) -> None:
+        """Set a virtual pitch offset on the head camera without moving joints."""
+
+        if self._head_camera_base_local_rotation is None:
+            raise RuntimeError("head camera forward pose has not been initialized")
+
+        camera_id = self._camera_id
+        cos_pitch = math.cos(pitch)
+        sin_pitch = math.sin(pitch)
+        pitch_rotation = np.array(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, cos_pitch, -sin_pitch],
+                [0.0, sin_pitch, cos_pitch],
+            ],
+            dtype=np.float64,
+        )
+        local_rotation = self._head_camera_base_local_rotation @ pitch_rotation
         local_quaternion = np.zeros(4, dtype=np.float64)
         mujoco.mju_mat2Quat(local_quaternion, local_rotation.reshape(-1))
         self.model.cam_quat[camera_id] = local_quaternion

@@ -1,7 +1,9 @@
 """V0.5 camera API and rendering invariants."""
 
 from pathlib import Path
+import math
 
+import mujoco
 import numpy as np
 import pytest
 
@@ -70,3 +72,23 @@ def test_camera_changes_after_turn() -> None:
         np.abs(before.astype(np.float32) - after.astype(np.float32))
     )
     assert difference > 1.0
+
+
+def test_head_camera_follows_robot_heading() -> None:
+    robot = _adapter()
+    camera_id = mujoco.mj_name2id(
+        robot.model,
+        mujoco.mjtObj.mjOBJ_CAMERA,
+        "head_camera",
+    )
+
+    quaternion = robot.data.qpos[
+        robot._trunk_qpos_adr + 3 : robot._trunk_qpos_adr + 7
+    ]
+    quaternion[:] = [math.cos(math.pi / 4.0), 0.0, 0.0, math.sin(math.pi / 4.0)]
+    mujoco.mj_forward(robot.model, robot.data)
+
+    camera_rotation = robot.data.cam_xmat[camera_id].reshape(3, 3)
+    optical_axis = -camera_rotation[:, 2]
+
+    assert optical_axis[1] > 0.9

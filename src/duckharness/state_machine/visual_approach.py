@@ -15,6 +15,7 @@ class ApproachState(Enum):
     SEARCH = auto()
     TRACK = auto()
     APPROACH = auto()
+    CAMERA_SCAN = auto()
     VERIFY = auto()
     RECOVER = auto()
     SUCCESS = auto()
@@ -41,10 +42,15 @@ class ApproachContext:
     aligned_count: int = 0
     recovery_count: int = 0
     last_seen_center_x: float | None = None
+    last_seen_center_y: float | None = None
+    last_seen_area_ratio: float = 0.0
     best_area_ratio: float = 0.0
     last_progress_step: int = 0
     recovery_mode: str | None = None
     recovery_steps_remaining: int = 0
+    scan_view_index: int = 0
+    scan_observation_count: int = 0
+    scan_visible_count: int = 0
 
     def observe(self, detection: Detection) -> None:
         """Update temporal visibility/alignment information."""
@@ -54,6 +60,9 @@ class ApproachContext:
             self.lost_count = 0
             if detection.center_x is not None:
                 self.last_seen_center_x = float(detection.center_x)
+            if detection.center_y is not None:
+                self.last_seen_center_y = float(detection.center_y)
+            self.last_seen_area_ratio = float(detection.area_ratio)
         else:
             self.lost_count += 1
 
@@ -71,6 +80,13 @@ class ApproachContext:
         self.visibility_history.clear()
         self.lost_count = 0
         self.aligned_count = 0
+
+    def reset_scan(self) -> None:
+        """Reset the deterministic virtual-camera scan."""
+
+        self.scan_view_index = 0
+        self.scan_observation_count = 0
+        self.scan_visible_count = 0
 
     def reset_progress(self) -> None:
         """Start a fresh visual-progress window after recovery."""

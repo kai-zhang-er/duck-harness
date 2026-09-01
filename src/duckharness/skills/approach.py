@@ -10,6 +10,7 @@ from typing import Protocol
 from duckharness.adapters.base import CameraFrame, RobotAdapter
 from duckharness.control.visual_servo import MotionCommand, VisualServoController
 from duckharness.perception.types import Detection
+from duckharness.perception.viewpoints import ViewpointManager
 from duckharness.state_machine import ApproachContext, ApproachState, StateTransition
 from duckharness.verification import (
     VerificationSample,
@@ -39,6 +40,8 @@ class ApproachTraceEntry:
     vx: float
     vyaw: float
     recovery_count: int
+    view: str = "head_forward"
+    center_y: float | None = None
 
 
 # Compatibility name for traces produced by V0.7 clients.
@@ -51,12 +54,15 @@ def approach_object(
     controller: VisualServoController,
     *,
     verifier: VisualApproachVerifier | None = None,
+    viewpoint_manager: ViewpointManager | None = None,
     timeout_steps: int = 3000,
     camera_interval_steps: int = 5,
     visible_window: int = 4,
     visible_confirmations: int = 3,
     align_confirmations: int = 3,
     max_lost_frames: int = 5,
+    near_field_lost_frames: int = 2,
+    camera_scan_confirmations: int = 2,
     verify_observations: int = 5,
     max_retries: int = 3,
     max_search_frames: int = 100,
@@ -81,6 +87,8 @@ def approach_object(
     _validate_positive_int(visible_confirmations, "visible_confirmations")
     _validate_positive_int(align_confirmations, "align_confirmations")
     _validate_positive_int(max_lost_frames, "max_lost_frames")
+    _validate_positive_int(near_field_lost_frames, "near_field_lost_frames")
+    _validate_positive_int(camera_scan_confirmations, "camera_scan_confirmations")
     _validate_positive_int(verify_observations, "verify_observations")
     _validate_nonnegative_int(max_retries, "max_retries")
     _validate_positive_int(max_search_frames, "max_search_frames")
@@ -89,6 +97,8 @@ def approach_object(
     _validate_positive_int(progress_window_steps, "progress_window_steps")
     if visible_confirmations > visible_window:
         raise ValueError("visible_confirmations must not exceed visible_window")
+    if camera_scan_confirmations > 10:
+        raise ValueError("camera_scan_confirmations must not exceed 10")
     if not math.isfinite(recovery_yaw_rate) or recovery_yaw_rate <= 0.0:
         raise ValueError("recovery_yaw_rate must be finite and positive")
     if not math.isfinite(backoff_speed) or backoff_speed <= 0.0:
@@ -101,6 +111,10 @@ def approach_object(
             stop_area_ratio=controller.stop_area_ratio,
             max_center_error=controller.stop_center_threshold,
         )
+    if viewpoint_manager is None:
+        viewpoint_manager = ViewpointManager(
+            scan_dwell_observations=camera_scan_confirmations
+        )
 
     context = ApproachContext()
     context.visibility_history = deque(maxlen=visible_window)
@@ -108,6 +122,7 @@ def approach_object(
     trace: list[ApproachTraceEntry] = []
     verification_history: list[VerificationSample] = []
     last_detection: Detection | None = None
+    active_view = viewpoint_manager.FORWARD
     last_command = MotionCommand(vx=0.0, vy=0.0, vyaw=0.0)
     perception_updates = 0
     total_lost_frames = 0
@@ -120,7 +135,7 @@ def approach_object(
             terminal_result: SkillResult | None = None
 
             if step_idx % camera_interval_steps == 0:
-                frame: CameraFrame = robot.get_camera_frame("head")
+                frame: CameraFrame = robot.get_camera_frame(active_view)
                 detection = detector.detect(frame.rgb)
                 last_detection = detection
                 perception_updates += 1
@@ -215,7 +230,35 @@ def approach_object(
                         last_command = _track_command(controller, detection)
 
                 elif context.state is ApproachState.APPROACH:
-                    if context.lost_count >= max_lost_frames:
+                    if (
+                        not detection.visible
+                        and context.lost_count >= near_field_lost_frames
+                        and viewpoint_manager.is_near_field_loss(
+                            last_center_y=context.last_seen_center_y,
+                            last_area_ratio=context.last_seen_area_ratio,
+                        )
+                    ):
+                        active_view = _start_camera_scan(
+                            context=context,
+                            viewpoint_manager=viewpoint_manager,
+                            sim_time=robot.sim_time,
+                            transitions=transitions,
+                            reason="near_field_target_lost",
+                        )
+                        last_command = MotionCommand(vx=0.0, vyaw=0.0)
+                    elif (
+                        detection.visible
+                        and viewpoint_manager.is_near_field(detection)
+                    ):
+                        active_view = _start_camera_scan(
+                            context=context,
+                            viewpoint_manager=viewpoint_manager,
+                            sim_time=robot.sim_time,
+                            transitions=transitions,
+                            reason="target_near_image_bottom",
+                        )
+                        last_command = MotionCommand(vx=0.0, vyaw=0.0)
+                    elif context.lost_count >= max_lost_frames:
                         terminal_result, last_command = _begin_recovery(
                             context=context,
                             mode="target_lost",
@@ -273,6 +316,65 @@ def approach_object(
                         )
                     else:
                         last_command = controller.command(detection)
+
+                elif context.state is ApproachState.CAMERA_SCAN:
+                    context.scan_observation_count += 1
+                    if detection.visible:
+                        context.scan_visible_count += 1
+                    else:
+                        context.scan_visible_count = 0
+
+                    if context.scan_visible_count >= camera_scan_confirmations:
+                        if detection.area_ratio >= controller.stop_area_ratio:
+                            verification_history = [_sample(detection)]
+                            _transition(
+                                context,
+                                ApproachState.VERIFY,
+                                robot.sim_time,
+                                "target_reacquired_in_camera_scan",
+                                transitions,
+                            )
+                            last_command = MotionCommand(vx=0.0, vyaw=0.0)
+                        else:
+                            _transition(
+                                context,
+                                ApproachState.TRACK,
+                                robot.sim_time,
+                                "target_reacquired_in_camera_scan",
+                                transitions,
+                            )
+                            context.aligned_count = 0
+                            last_command = _track_command(controller, detection)
+                    elif (
+                        context.scan_observation_count
+                        >= viewpoint_manager.scan_dwell_observations
+                    ):
+                        next_index = viewpoint_manager.next_view_index(
+                            context.scan_view_index
+                        )
+                        if next_index is None:
+                            context.reset_temporal_history()
+                            context.reset_scan()
+                            active_view = viewpoint_manager.FORWARD
+                            _transition(
+                                context,
+                                ApproachState.SEARCH,
+                                robot.sim_time,
+                                "camera_scan_exhausted",
+                                transitions,
+                            )
+                            last_command = controller.command(
+                                Detection(visible=False)
+                            )
+                            search_updates += 1
+                        else:
+                            context.scan_view_index = next_index
+                            context.scan_observation_count = 0
+                            context.scan_visible_count = 0
+                            active_view = viewpoint_manager.scan_order[next_index]
+                            last_command = MotionCommand(vx=0.0, vyaw=0.0)
+                    else:
+                        last_command = MotionCommand(vx=0.0, vyaw=0.0)
 
                 elif context.state is ApproachState.VERIFY:
                     verification_history.append(_sample(detection))
@@ -332,6 +434,8 @@ def approach_object(
                         vx=last_command.vx,
                         vyaw=last_command.vyaw,
                         recovery_count=context.recovery_count,
+                        view=active_view,
+                        center_y=detection.center_y,
                     )
                 )
 
@@ -373,6 +477,7 @@ def approach_object(
                         transitions,
                     )
                     last_command = MotionCommand(vx=0.0, vy=0.0, vyaw=0.0)
+                    active_view = viewpoint_manager.FORWARD
                     robot.stop()
 
             if state.fallen:
@@ -429,6 +534,29 @@ def approach_object(
         robot.stop()
 
 
+def _start_camera_scan(
+    *,
+    context: ApproachContext,
+    viewpoint_manager: ViewpointManager,
+    sim_time: float,
+    transitions: list[StateTransition],
+    reason: str,
+) -> str:
+    """Enter CAMERA_SCAN and return the first downward view to render."""
+
+    context.reset_scan()
+    scan_order = viewpoint_manager.scan_order
+    context.scan_view_index = 1 if len(scan_order) > 1 else 0
+    _transition(
+        context,
+        ApproachState.CAMERA_SCAN,
+        sim_time,
+        reason,
+        transitions,
+    )
+    return scan_order[context.scan_view_index]
+
+
 def _begin_recovery(
     *,
     context: ApproachContext,
@@ -480,6 +608,13 @@ def _begin_recovery(
         direction = _recovery_yaw_direction(controller, context.last_seen_center_x)
         rate = min(recovery_yaw_rate, controller.max_yaw_rate)
         command = MotionCommand(vx=0.0, vyaw=direction * rate)
+        context.recovery_steps_remaining = recovery_turn_steps
+    elif mode == "verification_failed" and detection.visible:
+        # The target is still in view, so keep the duck in place and correct
+        # the image-space heading before trying the verification window again.
+        # Backing away here can move a near target below the head camera and
+        # create a recovery loop even though perception is still healthy.
+        command = _track_command(controller, detection)
         context.recovery_steps_remaining = recovery_turn_steps
     else:
         command = MotionCommand(vx=-backoff_speed, vy=0.0, vyaw=0.0)
@@ -563,6 +698,7 @@ def _result(
             {
                 "visible": detection.visible,
                 "center_x": detection.center_x,
+                "center_y": detection.center_y,
                 "area_ratio": detection.area_ratio,
                 "final_center_error": (
                     abs(float(detection.center_x))
