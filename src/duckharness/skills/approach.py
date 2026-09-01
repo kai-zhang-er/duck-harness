@@ -1,14 +1,21 @@
-"""Vision-in-the-loop object-approach skill."""
+"""V0.8 stateful vision-in-the-loop object-approach skill."""
 
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass
 from typing import Protocol
 
 from duckharness.adapters.base import CameraFrame, RobotAdapter
 from duckharness.control.visual_servo import MotionCommand, VisualServoController
 from duckharness.perception.types import Detection
+from duckharness.state_machine import ApproachContext, ApproachState, StateTransition
+from duckharness.verification import (
+    VerificationSample,
+    VerificationResult,
+    VisualApproachVerifier,
+)
 
 from .base import SkillResult
 
@@ -21,16 +28,21 @@ class Detector(Protocol):
 
 
 @dataclass(frozen=True)
-class ServoTrace:
-    """One perception/control observation recorded by the approach skill."""
+class ApproachTraceEntry:
+    """One perception/control observation recorded by the skill."""
 
-    time: float
+    sim_time: float
+    state: ApproachState
     visible: bool
     center_x: float | None
     area_ratio: float
     vx: float
     vyaw: float
-    phase: str
+    recovery_count: int
+
+
+# Compatibility name for traces produced by V0.7 clients.
+ServoTrace = ApproachTraceEntry
 
 
 def approach_object(
@@ -38,117 +50,295 @@ def approach_object(
     detector: Detector,
     controller: VisualServoController,
     *,
+    verifier: VisualApproachVerifier | None = None,
     timeout_steps: int = 3000,
     camera_interval_steps: int = 5,
-    max_lost_frames: int = 100,
+    visible_window: int = 4,
+    visible_confirmations: int = 3,
+    align_confirmations: int = 3,
+    max_lost_frames: int = 5,
+    verify_observations: int = 5,
+    max_retries: int = 3,
+    max_search_frames: int = 100,
+    recovery_turn_steps: int = 15,
+    recovery_backoff_steps: int = 10,
+    recovery_yaw_rate: float = 1.0,
+    backoff_speed: float = 0.30,
     progress_window_steps: int = 500,
-    min_area_gain: float = 0.005,
+    min_area_gain: float = 0.002,
 ) -> SkillResult:
-    """Find and approach an object using only camera detections.
+    """Find, approach, verify, and recover around a visual target.
 
-    The robot advances exactly one adapter control period per loop iteration.
-    Camera perception runs at ``1 / camera_interval_steps`` of that rate;
-    between captures, the most recent command remains active. No target/world
-    coordinates are read by this skill.
+    Behavior uses only camera frames and detector output. Ground-truth target
+    coordinates are intentionally not available to this function. Physics is
+    advanced one adapter control period at a time while perception runs at the
+    requested interval.
     """
 
     _validate_positive_int(timeout_steps, "timeout_steps")
     _validate_positive_int(camera_interval_steps, "camera_interval_steps")
+    _validate_positive_int(visible_window, "visible_window")
+    _validate_positive_int(visible_confirmations, "visible_confirmations")
+    _validate_positive_int(align_confirmations, "align_confirmations")
     _validate_positive_int(max_lost_frames, "max_lost_frames")
+    _validate_positive_int(verify_observations, "verify_observations")
+    _validate_nonnegative_int(max_retries, "max_retries")
+    _validate_positive_int(max_search_frames, "max_search_frames")
+    _validate_positive_int(recovery_turn_steps, "recovery_turn_steps")
+    _validate_positive_int(recovery_backoff_steps, "recovery_backoff_steps")
     _validate_positive_int(progress_window_steps, "progress_window_steps")
+    if visible_confirmations > visible_window:
+        raise ValueError("visible_confirmations must not exceed visible_window")
+    if not math.isfinite(recovery_yaw_rate) or recovery_yaw_rate <= 0.0:
+        raise ValueError("recovery_yaw_rate must be finite and positive")
+    if not math.isfinite(backoff_speed) or backoff_speed <= 0.0:
+        raise ValueError("backoff_speed must be finite and positive")
     if not math.isfinite(min_area_gain) or min_area_gain < 0.0:
         raise ValueError("min_area_gain must be finite and non-negative")
 
-    traces: list[ServoTrace] = []
+    if verifier is None:
+        verifier = VisualApproachVerifier(
+            stop_area_ratio=controller.stop_area_ratio,
+            max_center_error=controller.stop_center_threshold,
+        )
+
+    context = ApproachContext()
+    context.visibility_history = deque(maxlen=visible_window)
+    transitions: list[StateTransition] = []
+    trace: list[ApproachTraceEntry] = []
+    verification_history: list[VerificationSample] = []
     last_detection: Detection | None = None
     last_command = MotionCommand(vx=0.0, vy=0.0, vyaw=0.0)
-    lost_frames = 0
+    perception_updates = 0
     total_lost_frames = 0
     search_updates = 0
-    perception_updates = 0
-    best_area_ratio = 0.0
-    last_progress_step = 0
-    target_seen = False
     path_length = 0.0
     previous_position = robot.state().position
 
     try:
         for step_idx in range(timeout_steps):
+            terminal_result: SkillResult | None = None
+
             if step_idx % camera_interval_steps == 0:
                 frame: CameraFrame = robot.get_camera_frame("head")
-                last_detection = detector.detect(frame.rgb)
+                detection = detector.detect(frame.rgb)
+                last_detection = detection
                 perception_updates += 1
 
-                if last_detection.visible:
-                    target_seen = True
-                    lost_frames = 0
-                    if last_detection.area_ratio > best_area_ratio + min_area_gain:
-                        best_area_ratio = last_detection.area_ratio
-                        last_progress_step = step_idx
-                else:
-                    lost_frames += 1
-                    total_lost_frames += 1
-                    search_updates += 1
+                if context.state is not ApproachState.RECOVER:
+                    context.observe(detection)
+                    if not detection.visible:
+                        total_lost_frames += 1
+                    elif detection.area_ratio > (
+                        context.best_area_ratio + min_area_gain
+                    ):
+                        context.best_area_ratio = detection.area_ratio
+                        context.last_progress_step = step_idx
 
-                if controller.reached_target(last_detection):
-                    return _result(
-                        success=True,
-                        reason="visual_target_reached",
-                        detection=last_detection,
-                        step_idx=step_idx,
-                        traces=traces,
-                        path_length=path_length,
-                        best_area_ratio=best_area_ratio,
-                        perception_updates=perception_updates,
-                        total_lost_frames=total_lost_frames,
-                        search_updates=search_updates,
-                    )
+                if context.state is ApproachState.SEARCH:
+                    if context.stable_visible(visible_confirmations):
+                        _transition(
+                            context,
+                            ApproachState.TRACK,
+                            robot.sim_time,
+                            "stable_target_detected",
+                            transitions,
+                        )
+                        context.aligned_count = 0
+                    else:
+                        last_command = controller.command(
+                            Detection(visible=False)
+                        )
+                        search_updates += 1
+                        if search_updates >= max_search_frames:
+                            _transition(
+                                context,
+                                ApproachState.FAILURE,
+                                robot.sim_time,
+                                "target_not_found",
+                                transitions,
+                            )
+                            terminal_result = _result(
+                                success=False,
+                                reason="target_not_found",
+                                context=context,
+                                detection=detection,
+                                step_idx=step_idx,
+                                trace=trace,
+                                transitions=transitions,
+                                path_length=path_length,
+                                perception_updates=perception_updates,
+                                total_lost_frames=total_lost_frames,
+                                search_updates=search_updates,
+                            )
 
-                last_command = controller.command(last_detection)
-                traces.append(
-                    ServoTrace(
-                        time=robot.sim_time,
-                        visible=last_detection.visible,
-                        center_x=last_detection.center_x,
-                        area_ratio=last_detection.area_ratio,
+                elif context.state is ApproachState.TRACK:
+                    if context.lost_count >= max_lost_frames:
+                        terminal_result, last_command = _begin_recovery(
+                            context=context,
+                            mode="target_lost",
+                            controller=controller,
+                            recovery_yaw_rate=recovery_yaw_rate,
+                            recovery_turn_steps=recovery_turn_steps,
+                            recovery_backoff_steps=recovery_backoff_steps,
+                            backoff_speed=backoff_speed,
+                            max_retries=max_retries,
+                            sim_time=robot.sim_time,
+                            transitions=transitions,
+                            detection=detection,
+                            step_idx=step_idx,
+                            path_length=path_length,
+                            perception_updates=perception_updates,
+                            total_lost_frames=total_lost_frames,
+                            search_updates=search_updates,
+                        )
+                    elif detection.visible and detection.center_x is not None:
+                        if (
+                            abs(float(detection.center_x))
+                            <= controller.centered_threshold
+                        ):
+                            context.aligned_count += 1
+                        else:
+                            context.aligned_count = 0
+                        if context.aligned_count >= align_confirmations:
+                            _transition(
+                                context,
+                                ApproachState.APPROACH,
+                                robot.sim_time,
+                                "stable_alignment",
+                                transitions,
+                            )
+                            last_command = controller.command(detection)
+                        else:
+                            last_command = _track_command(controller, detection)
+                    else:
+                        last_command = _track_command(controller, detection)
+
+                elif context.state is ApproachState.APPROACH:
+                    if context.lost_count >= max_lost_frames:
+                        terminal_result, last_command = _begin_recovery(
+                            context=context,
+                            mode="target_lost",
+                            controller=controller,
+                            recovery_yaw_rate=recovery_yaw_rate,
+                            recovery_turn_steps=recovery_turn_steps,
+                            recovery_backoff_steps=recovery_backoff_steps,
+                            backoff_speed=backoff_speed,
+                            max_retries=max_retries,
+                            sim_time=robot.sim_time,
+                            transitions=transitions,
+                            detection=detection,
+                            step_idx=step_idx,
+                            path_length=path_length,
+                            perception_updates=perception_updates,
+                            total_lost_frames=total_lost_frames,
+                            search_updates=search_updates,
+                        )
+                    elif (
+                        detection.visible
+                        and detection.area_ratio >= controller.stop_area_ratio
+                    ):
+                        verification_history = [_sample(detection)]
+                        _transition(
+                            context,
+                            ApproachState.VERIFY,
+                            robot.sim_time,
+                            "visual_target_close",
+                            transitions,
+                        )
+                        last_command = MotionCommand(vx=0.0, vyaw=0.0)
+                    elif (
+                        detection.visible
+                        and context.best_area_ratio < controller.stop_area_ratio
+                        and step_idx - context.last_progress_step
+                        >= progress_window_steps
+                    ):
+                        terminal_result, last_command = _begin_recovery(
+                            context=context,
+                            mode="no_visual_progress",
+                            controller=controller,
+                            recovery_yaw_rate=recovery_yaw_rate,
+                            recovery_turn_steps=recovery_turn_steps,
+                            recovery_backoff_steps=recovery_backoff_steps,
+                            backoff_speed=backoff_speed,
+                            max_retries=max_retries,
+                            sim_time=robot.sim_time,
+                            transitions=transitions,
+                            detection=detection,
+                            step_idx=step_idx,
+                            path_length=path_length,
+                            perception_updates=perception_updates,
+                            total_lost_frames=total_lost_frames,
+                            search_updates=search_updates,
+                        )
+                    else:
+                        last_command = controller.command(detection)
+
+                elif context.state is ApproachState.VERIFY:
+                    verification_history.append(_sample(detection))
+                    last_command = MotionCommand(vx=0.0, vyaw=0.0)
+                    if len(verification_history) >= verify_observations:
+                        verification = verifier.verify(verification_history)
+                        if verification.success:
+                            _transition(
+                                context,
+                                ApproachState.SUCCESS,
+                                robot.sim_time,
+                                verification.reason,
+                                transitions,
+                            )
+                            terminal_result = _result(
+                                success=True,
+                                reason=verification.reason,
+                                context=context,
+                                detection=detection,
+                                step_idx=step_idx,
+                                trace=trace,
+                                transitions=transitions,
+                                path_length=path_length,
+                                perception_updates=perception_updates,
+                                total_lost_frames=total_lost_frames,
+                                search_updates=search_updates,
+                                verification=verification,
+                            )
+                        else:
+                            terminal_result, last_command = _begin_recovery(
+                                context=context,
+                                mode="verification_failed",
+                                controller=controller,
+                                recovery_yaw_rate=recovery_yaw_rate,
+                                recovery_turn_steps=recovery_turn_steps,
+                                recovery_backoff_steps=recovery_backoff_steps,
+                                backoff_speed=backoff_speed,
+                                max_retries=max_retries,
+                                sim_time=robot.sim_time,
+                                transitions=transitions,
+                                detection=detection,
+                                step_idx=step_idx,
+                                path_length=path_length,
+                                perception_updates=perception_updates,
+                                total_lost_frames=total_lost_frames,
+                                search_updates=search_updates,
+                            )
+
+                # RECOVER holds the command selected when recovery started.
+                trace.append(
+                    ApproachTraceEntry(
+                        sim_time=robot.sim_time,
+                        state=context.state,
+                        visible=detection.visible,
+                        center_x=detection.center_x,
+                        area_ratio=detection.area_ratio,
                         vx=last_command.vx,
                         vyaw=last_command.vyaw,
-                        phase=controller.phase(last_detection).value,
+                        recovery_count=context.recovery_count,
                     )
                 )
 
-                if lost_frames > max_lost_frames:
-                    return _result(
-                        success=False,
-                        reason="target_not_found",
-                        detection=last_detection,
-                        step_idx=step_idx,
-                        traces=traces,
-                        path_length=path_length,
-                        best_area_ratio=best_area_ratio,
-                        perception_updates=perception_updates,
-                        total_lost_frames=total_lost_frames,
-                        search_updates=search_updates,
+                if terminal_result is not None:
+                    return _with_trace_and_transitions(
+                        terminal_result, trace, transitions
                     )
-
-                if (
-                    target_seen
-                    and step_idx - last_progress_step >= progress_window_steps
-                    and best_area_ratio < controller.stop_area_ratio
-                ):
-                    return _result(
-                        success=False,
-                        reason="no_visual_progress",
-                        detection=last_detection,
-                        step_idx=step_idx,
-                        traces=traces,
-                        path_length=path_length,
-                        best_area_ratio=best_area_ratio,
-                        perception_updates=perception_updates,
-                        total_lost_frames=total_lost_frames,
-                        search_updates=search_updates,
-                    )
-
                 robot.move(
                     vx=last_command.vx,
                     vy=last_command.vy,
@@ -161,48 +351,201 @@ def approach_object(
             path_length += math.dist(previous_position[:2], current_position[:2])
             previous_position = current_position
 
+            if context.state is ApproachState.RECOVER:
+                context.recovery_steps_remaining -= 1
+                if context.recovery_steps_remaining <= 0:
+                    mode = context.recovery_mode
+                    context.reset_temporal_history()
+                    context.reset_progress()
+                    context.recovery_mode = None
+                    next_state = (
+                        ApproachState.SEARCH
+                        if mode == "target_lost"
+                        else ApproachState.TRACK
+                    )
+                    _transition(
+                        context,
+                        next_state,
+                        robot.sim_time,
+                        "recovery_search"
+                        if next_state is ApproachState.SEARCH
+                        else "recovery_realign",
+                        transitions,
+                    )
+                    last_command = MotionCommand(vx=0.0, vy=0.0, vyaw=0.0)
+                    robot.stop()
+
             if state.fallen:
-                return _result(
-                    success=False,
-                    reason="robot_fallen",
-                    detection=last_detection,
-                    step_idx=step_idx + 1,
-                    traces=traces,
-                    path_length=path_length,
-                    best_area_ratio=best_area_ratio,
-                    perception_updates=perception_updates,
-                    total_lost_frames=total_lost_frames,
-                    search_updates=search_updates,
+                _transition(
+                    context,
+                    ApproachState.FAILURE,
+                    robot.sim_time,
+                    "robot_fallen",
+                    transitions,
+                )
+                return _with_trace_and_transitions(
+                    _result(
+                        success=False,
+                        reason="robot_fallen",
+                        context=context,
+                        detection=last_detection,
+                        step_idx=step_idx + 1,
+                        trace=trace,
+                        transitions=transitions,
+                        path_length=path_length,
+                        perception_updates=perception_updates,
+                        total_lost_frames=total_lost_frames,
+                        search_updates=search_updates,
+                    ),
+                    trace,
+                    transitions,
                 )
 
-        return _result(
-            success=False,
-            reason="timeout",
-            detection=last_detection,
-            step_idx=timeout_steps,
-            traces=traces,
-            path_length=path_length,
-            best_area_ratio=best_area_ratio,
-            perception_updates=perception_updates,
-            total_lost_frames=total_lost_frames,
-            search_updates=search_updates,
+        _transition(
+            context,
+            ApproachState.FAILURE,
+            robot.sim_time,
+            "timeout",
+            transitions,
+        )
+        return _with_trace_and_transitions(
+            _result(
+                success=False,
+                reason="timeout",
+                context=context,
+                detection=last_detection,
+                step_idx=timeout_steps,
+                trace=trace,
+                transitions=transitions,
+                path_length=path_length,
+                perception_updates=perception_updates,
+                total_lost_frames=total_lost_frames,
+                search_updates=search_updates,
+            ),
+            trace,
+            transitions,
         )
     finally:
         robot.stop()
+
+
+def _begin_recovery(
+    *,
+    context: ApproachContext,
+    mode: str,
+    controller: VisualServoController,
+    recovery_yaw_rate: float,
+    recovery_turn_steps: int,
+    recovery_backoff_steps: int,
+    backoff_speed: float,
+    max_retries: int,
+    sim_time: float,
+    transitions: list[StateTransition],
+    detection: Detection,
+    step_idx: int,
+    path_length: float,
+    perception_updates: int,
+    total_lost_frames: int,
+    search_updates: int,
+) -> tuple[SkillResult | None, MotionCommand]:
+    context.recovery_count += 1
+    if context.recovery_count > max_retries:
+        _transition(
+            context,
+            ApproachState.FAILURE,
+            sim_time,
+            "recovery_exhausted",
+            transitions,
+        )
+        return (
+            _result(
+                success=False,
+                reason="recovery_exhausted",
+                context=context,
+                detection=detection,
+                step_idx=step_idx,
+                trace=[],
+                transitions=transitions,
+                path_length=path_length,
+                perception_updates=perception_updates,
+                total_lost_frames=total_lost_frames,
+                search_updates=search_updates,
+            ),
+            MotionCommand(vx=0.0, vy=0.0, vyaw=0.0),
+        )
+
+    _transition(context, ApproachState.RECOVER, sim_time, mode, transitions)
+    context.recovery_mode = mode
+    if mode == "target_lost":
+        direction = _recovery_yaw_direction(controller, context.last_seen_center_x)
+        rate = min(recovery_yaw_rate, controller.max_yaw_rate)
+        command = MotionCommand(vx=0.0, vyaw=direction * rate)
+        context.recovery_steps_remaining = recovery_turn_steps
+    else:
+        command = MotionCommand(vx=-backoff_speed, vy=0.0, vyaw=0.0)
+        context.recovery_steps_remaining = recovery_backoff_steps
+    return None, command
+
+
+def _recovery_yaw_direction(
+    controller: VisualServoController,
+    last_seen_center_x: float | None,
+) -> float:
+    if last_seen_center_x is None or abs(last_seen_center_x) < 1e-9:
+        return 1.0
+    return math.copysign(1.0, controller.yaw_sign * last_seen_center_x)
+
+
+def _track_command(
+    controller: VisualServoController,
+    detection: Detection,
+) -> MotionCommand:
+    command = controller.command(detection)
+    return MotionCommand(vx=0.0, vy=0.0, vyaw=command.vyaw)
+
+
+def _sample(detection: Detection) -> VerificationSample:
+    return VerificationSample(
+        visible=detection.visible,
+        center_x=detection.center_x,
+        area_ratio=detection.area_ratio,
+    )
+
+
+def _transition(
+    context: ApproachContext,
+    state: ApproachState,
+    sim_time: float,
+    reason: str,
+    transitions: list[StateTransition],
+) -> None:
+    if context.state is state:
+        return
+    transitions.append(
+        StateTransition(
+            sim_time=sim_time,
+            previous=context.state,
+            current=state,
+            reason=reason,
+        )
+    )
+    context.state = state
 
 
 def _result(
     *,
     success: bool,
     reason: str,
+    context: ApproachContext,
     detection: Detection | None,
     step_idx: int,
-    traces: list[ServoTrace],
+    trace: list[ApproachTraceEntry],
+    transitions: list[StateTransition],
     path_length: float,
-    best_area_ratio: float,
     perception_updates: int,
     total_lost_frames: int,
     search_updates: int,
+    verification: VerificationResult | None = None,
 ) -> SkillResult:
     evidence: dict[str, object] = {
         "steps": step_idx,
@@ -210,8 +553,10 @@ def _result(
         "target_lost_count": total_lost_frames,
         "search_steps": search_updates,
         "path_length": path_length,
-        "best_area_ratio": best_area_ratio,
-        "trace": tuple(traces),
+        "best_area_ratio": context.best_area_ratio,
+        "recovery_count": context.recovery_count,
+        "final_state": context.state,
+        "transitions": tuple(transitions),
     }
     if detection is not None:
         evidence.update(
@@ -219,11 +564,38 @@ def _result(
                 "visible": detection.visible,
                 "center_x": detection.center_x,
                 "area_ratio": detection.area_ratio,
+                "final_center_error": (
+                    abs(float(detection.center_x))
+                    if detection.center_x is not None
+                    else math.inf
+                ),
             }
         )
-    return SkillResult(success=success, reason=reason, evidence=evidence)
+    if verification is not None:
+        evidence["verification"] = verification.evidence
+    return SkillResult(
+        success=success,
+        reason=reason,
+        evidence=evidence,
+        trace=tuple(trace),
+    )
+
+
+def _with_trace_and_transitions(
+    result: SkillResult,
+    trace: list[ApproachTraceEntry],
+    transitions: list[StateTransition],
+) -> SkillResult:
+    result.trace = tuple(trace)
+    result.evidence["transitions"] = tuple(transitions)
+    return result
 
 
 def _validate_positive_int(value: int, name: str) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
+
+
+def _validate_nonnegative_int(value: int, name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")

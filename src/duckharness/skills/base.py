@@ -11,3 +11,4 @@ class SkillResult:
     success: bool
     reason: str = ""
     evidence: dict[str, Any] = field(default_factory=dict)
+    trace: tuple[Any, ...] = ()

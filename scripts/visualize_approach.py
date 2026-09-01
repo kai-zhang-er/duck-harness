@@ -77,7 +77,21 @@ with mujoco.viewer.launch_passive(robot.model, robot.data) as viewer:
         timeout_steps=3000,
         camera_interval_steps=5,
     )
-    print(result)
+    print(f"Result: {'SUCCESS' if result.success else 'FAILURE'}")
+    print(f"Reason: {result.reason}")
+    print("Transitions:")
+    for transition in result.evidence["transitions"]:
+        print(
+            f"  {transition.sim_time:.2f}s "
+            f"{transition.previous.name} -> {transition.current.name} "
+            f"({transition.reason})"
+        )
+    print(
+        f"Recoveries: {result.evidence['recovery_count']} | "
+        f"Trace entries: {len(result.trace)} | "
+        f"Final center_x: {result.evidence.get('center_x')} | "
+        f"Final area_ratio: {result.evidence.get('area_ratio')}"
+    )
 
     while viewer.is_running():
         viewer.sync()

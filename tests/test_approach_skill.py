@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from duckharness.adapters import CameraFrame, RobotState
 from duckharness.perception import Detection
+from duckharness.state_machine import ApproachState
 from duckharness.skills import approach_object
 
 
@@ -65,7 +66,16 @@ def test_approach_reaches_target_and_records_trace() -> None:
     detector = _SequenceDetector(
         [
             Detection(visible=True, center_x=0.4, area_ratio=0.01),
+            Detection(visible=True, center_x=0.4, area_ratio=0.01),
+            Detection(visible=True, center_x=0.4, area_ratio=0.01),
+            Detection(visible=True, center_x=0.4, area_ratio=0.01),
             Detection(visible=True, center_x=0.05, area_ratio=0.04),
+            Detection(visible=True, center_x=0.05, area_ratio=0.04),
+            Detection(visible=True, center_x=0.05, area_ratio=0.04),
+            Detection(visible=True, center_x=0.03, area_ratio=0.09),
+            Detection(visible=True, center_x=0.03, area_ratio=0.09),
+            Detection(visible=True, center_x=0.03, area_ratio=0.09),
+            Detection(visible=True, center_x=0.03, area_ratio=0.09),
             Detection(visible=True, center_x=0.03, area_ratio=0.09),
         ]
     )
@@ -74,38 +84,58 @@ def test_approach_reaches_target_and_records_trace() -> None:
         robot,
         detector,
         _controller(),
-        timeout_steps=10,
-        camera_interval_steps=2,
+        timeout_steps=20,
+        camera_interval_steps=1,
     )
 
     assert result.success
-    assert result.reason == "visual_target_reached"
-    assert result.evidence["steps"] == 4
-    assert result.evidence["perception_updates"] == 3
-    assert len(result.evidence["trace"]) == 2
+    assert result.reason == "verified_target_reached"
+    assert result.evidence["steps"] == 11
+    assert result.evidence["perception_updates"] == 12
+    assert len(result.trace) == 12
     assert result.evidence["path_length"] > 0.0
-    assert robot.stop_count == 1
+    assert robot.stop_count >= 1
 
 
 def test_approach_fails_after_target_is_lost() -> None:
     robot = _FakeRobot()
-    detector = _SequenceDetector([Detection(visible=False)])
+    detector = _SequenceDetector(
+        [
+            Detection(visible=True, center_x=0.4, area_ratio=0.01),
+            Detection(visible=True, center_x=0.4, area_ratio=0.01),
+            Detection(visible=True, center_x=0.4, area_ratio=0.01),
+            Detection(visible=True, center_x=0.4, area_ratio=0.01),
+            Detection(visible=True, center_x=0.0, area_ratio=0.01),
+            Detection(visible=True, center_x=0.0, area_ratio=0.01),
+            Detection(visible=True, center_x=0.0, area_ratio=0.01),
+            Detection(visible=False),
+        ]
+    )
 
     result = approach_object(
         robot,
         detector,
         _controller(),
-        timeout_steps=10,
+        timeout_steps=30,
         camera_interval_steps=1,
         max_lost_frames=2,
+        recovery_turn_steps=2,
+        max_search_frames=10,
     )
 
     assert not result.success
     assert result.reason == "target_not_found"
-    assert result.evidence["steps"] == 2
-    assert result.evidence["target_lost_count"] == 3
-    assert result.evidence["search_steps"] == 3
-    assert robot.stop_count == 1
+    assert result.evidence["recovery_count"] == 1
+    assert any(
+        transition.current is ApproachState.RECOVER
+        for transition in result.evidence["transitions"]
+    )
+    assert any(
+        transition.current is ApproachState.SEARCH
+        and transition.reason == "recovery_search"
+        for transition in result.evidence["transitions"]
+    )
+    assert robot.stop_count >= 1
 
 
 def test_approach_reports_missing_visual_progress() -> None:
@@ -118,16 +148,23 @@ def test_approach_reports_missing_visual_progress() -> None:
         robot,
         detector,
         _controller(),
-        timeout_steps=10,
+        timeout_steps=30,
         camera_interval_steps=1,
         progress_window_steps=3,
         min_area_gain=0.005,
+        visible_confirmations=3,
+        align_confirmations=1,
+        recovery_backoff_steps=1,
+        max_retries=1,
     )
 
     assert not result.success
-    assert result.reason == "no_visual_progress"
-    assert result.evidence["steps"] == 3
-    assert robot.stop_count == 1
+    assert result.reason == "recovery_exhausted"
+    assert any(
+        transition.reason == "no_visual_progress"
+        for transition in result.evidence["transitions"]
+    )
+    assert robot.stop_count >= 1
 
 
 def _controller():
