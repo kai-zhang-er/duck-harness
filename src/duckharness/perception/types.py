@@ -13,3 +13,13 @@ class Detection:
     bbox: tuple[int, int, int, int] | None = None
     area_ratio: float = 0.0
     confidence: float = 0.0
+    touches_left: bool = False
+    touches_right: bool = False
+    touches_top: bool = False
+    touches_bottom: bool = False
+
+    @property
+    def vertical_position_reliable(self) -> bool:
+        """Whether the vertical centroid is not clipped by an image border."""
+
+        return not (self.touches_top or self.touches_bottom)

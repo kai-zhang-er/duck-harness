@@ -13,10 +13,15 @@ def test_viewpoint_scan_order_and_bottom_trigger() -> None:
         "head_down_20",
         "head_down_35",
     )
+    assert manager.near_field_order == (
+        "head_down_20",
+        "head_down_35",
+        "head_down_60",
+    )
     assert manager.is_near_field(
         Detection(visible=True, center_y=0.7, area_ratio=0.06)
     )
-    assert not manager.is_near_field(
+    assert manager.is_near_field(
         Detection(visible=True, center_y=0.5, area_ratio=0.06)
     )
     assert manager.next_view_index(0) == 1

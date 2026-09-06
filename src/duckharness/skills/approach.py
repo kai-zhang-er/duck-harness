@@ -13,9 +13,15 @@ from duckharness.perception.types import Detection
 from duckharness.perception.viewpoints import ViewpointManager
 from duckharness.state_machine import ApproachContext, ApproachState, StateTransition
 from duckharness.verification import (
+    ApproachHistorySummary,
+    NearFieldEvidence,
+    NearFieldVerificationResult,
+    NearFieldVerifier,
     VerificationSample,
     VerificationResult,
     VisualApproachVerifier,
+    collect_near_field_evidence,
+    summarize_approach_history,
 )
 
 from .base import SkillResult
@@ -34,15 +40,18 @@ class ApproachTraceEntry:
 
     sim_time: float
     state: ApproachState
-    camera_name: str
     visible: bool
     center_x: float | None
     area_ratio: float
     vx: float
     vyaw: float
     recovery_count: int
+    # Compatibility name for V0.8 clients that read ``view``.
     view: str = "head_forward"
+    camera_name: str = "head_forward"
     center_y: float | None = None
+    touches_bottom: bool = False
+    near_field_retry_count: int = 0
 
 
 # Compatibility name for traces produced by V0.7 clients.
@@ -65,6 +74,9 @@ def approach_object(
     near_field_lost_frames: int = 2,
     camera_scan_confirmations: int = 2,
     verify_observations: int = 5,
+    near_field_frames_per_view: int = 3,
+    max_near_field_retries: int = 3,
+    near_field_verifier: NearFieldVerifier | None = None,
     max_retries: int = 3,
     max_search_frames: int = 100,
     recovery_turn_steps: int = 15,
@@ -91,6 +103,8 @@ def approach_object(
     _validate_positive_int(near_field_lost_frames, "near_field_lost_frames")
     _validate_positive_int(camera_scan_confirmations, "camera_scan_confirmations")
     _validate_positive_int(verify_observations, "verify_observations")
+    _validate_positive_int(near_field_frames_per_view, "near_field_frames_per_view")
+    _validate_nonnegative_int(max_near_field_retries, "max_near_field_retries")
     _validate_nonnegative_int(max_retries, "max_retries")
     _validate_positive_int(max_search_frames, "max_search_frames")
     _validate_positive_int(recovery_turn_steps, "recovery_turn_steps")
@@ -112,6 +126,11 @@ def approach_object(
             stop_area_ratio=controller.stop_area_ratio,
             max_center_error=controller.stop_center_threshold,
         )
+    if near_field_verifier is None:
+        near_field_verifier = NearFieldVerifier(
+            max_center_error=controller.stop_center_threshold,
+            min_area_ratio=max(0.08, controller.stop_area_ratio),
+        )
     if viewpoint_manager is None:
         viewpoint_manager = ViewpointManager(
             scan_dwell_observations=camera_scan_confirmations
@@ -122,6 +141,9 @@ def approach_object(
     transitions: list[StateTransition] = []
     trace: list[ApproachTraceEntry] = []
     verification_history: list[VerificationSample] = []
+    near_field_evidence: NearFieldEvidence | None = None
+    near_field_history: ApproachHistorySummary | None = None
+    near_field_result: NearFieldVerificationResult | None = None
     last_detection: Detection | None = None
     active_view = viewpoint_manager.FORWARD
     last_command = MotionCommand(vx=0.0, vy=0.0, vyaw=0.0)
@@ -143,6 +165,8 @@ def approach_object(
 
                 if context.state is not ApproachState.RECOVER:
                     context.observe(detection)
+                    if context.state is ApproachState.APPROACH:
+                        context.record_approach(detection)
                     if not detection.visible:
                         total_lost_frames += 1
                     elif detection.area_ratio > (
@@ -193,6 +217,7 @@ def approach_object(
                         if viewpoint_manager.is_near_field_loss(
                             last_center_y=context.last_seen_center_y,
                             last_area_ratio=context.last_seen_area_ratio,
+                            last_touches_bottom=context.last_seen_touches_bottom,
                             camera_name=active_view,
                         ):
                             active_view = _start_camera_scan(
@@ -202,6 +227,7 @@ def approach_object(
                                 transitions=transitions,
                                 reason="target_lost_near",
                             )
+                            robot.stop()
                             last_command = MotionCommand(vx=0.0, vyaw=0.0)
                         else:
                             terminal_result, last_command = _begin_recovery(
@@ -251,6 +277,7 @@ def approach_object(
                         and viewpoint_manager.is_near_field_loss(
                             last_center_y=context.last_seen_center_y,
                             last_area_ratio=context.last_seen_area_ratio,
+                            last_touches_bottom=context.last_seen_touches_bottom,
                             camera_name=active_view,
                         )
                     ):
@@ -261,6 +288,7 @@ def approach_object(
                             transitions=transitions,
                             reason="target_lost_near",
                         )
+                        robot.stop()
                         last_command = MotionCommand(vx=0.0, vyaw=0.0)
                     elif (
                         detection.visible
@@ -276,6 +304,7 @@ def approach_object(
                             transitions=transitions,
                             reason="target_near_image_bottom",
                         )
+                        robot.stop()
                         last_command = MotionCommand(vx=0.0, vyaw=0.0)
                     elif context.lost_count >= max_lost_frames:
                         terminal_result, last_command = _begin_recovery(
@@ -345,96 +374,104 @@ def approach_object(
                             active_view,
                         )
 
-                elif context.state is ApproachState.CAMERA_SCAN:
-                    context.scan_observation_count += 1
-                    if detection.visible:
-                        context.scan_visible_count += 1
-                    else:
-                        context.scan_visible_count = 0
-
-                    if context.scan_visible_count >= camera_scan_confirmations:
-                        if viewpoint_manager.is_near_target(
-                            detection,
-                            camera_name=active_view,
-                            minimum_area_ratio=controller.stop_area_ratio,
-                            max_center_error=controller.stop_center_threshold,
-                        ):
-                            verification_history = [_sample(detection)]
-                            _transition(
-                                context,
-                                ApproachState.VERIFY,
-                                robot.sim_time,
-                                "target_reacquired_in_camera_scan",
-                                transitions,
-                            )
-                            last_command = MotionCommand(vx=0.0, vyaw=0.0)
-                        elif viewpoint_manager.should_descend(
-                            detection,
-                            active_view,
-                        ):
-                            next_index = viewpoint_manager.next_view_index(
-                                context.scan_view_index
-                            )
-                            if next_index is not None:
-                                context.scan_view_index = next_index
-                                context.scan_observation_count = 0
-                                context.scan_visible_count = 0
-                                active_view = viewpoint_manager.scan_order[next_index]
-                                last_command = MotionCommand(vx=0.0, vyaw=0.0)
-                            else:
-                                last_command = _track_command(controller, detection)
-                        elif viewpoint_manager.should_return_forward(detection):
-                            context.reset_scan()
-                            active_view = viewpoint_manager.FORWARD
-                            _transition(
-                                context,
-                                ApproachState.TRACK,
-                                robot.sim_time,
-                                "camera_hysteresis_return_forward",
-                                transitions,
-                            )
-                            context.aligned_count = 0
-                            last_command = _track_command(controller, detection)
-                        else:
-                            _transition(
-                                context,
-                                ApproachState.TRACK,
-                                robot.sim_time,
-                                "target_reacquired_in_camera_scan",
-                                transitions,
-                            )
-                            context.aligned_count = 0
-                            last_command = _track_command(controller, detection)
-                    elif (
-                        context.scan_observation_count
-                        >= viewpoint_manager.scan_dwell_observations
-                    ):
-                        next_index = viewpoint_manager.next_view_index(
-                            context.scan_view_index
+                elif context.state is ApproachState.NEAR_FIELD:
+                    # Freeze locomotion while collecting evidence from every
+                    # downward view. This path deliberately accepts partial
+                    # border-clipped detections.
+                    robot.stop()
+                    near_field_evidence, near_field_observations = (
+                        collect_near_field_evidence(
+                            robot,
+                            detector,
+                            viewpoint_manager.near_field_order,
+                            frames_per_view=near_field_frames_per_view,
                         )
-                        if next_index is None:
-                            context.reset_temporal_history()
-                            context.reset_scan()
-                            active_view = viewpoint_manager.FORWARD
-                            _transition(
-                                context,
-                                ApproachState.SEARCH,
-                                robot.sim_time,
-                                "camera_scan_exhausted",
-                                transitions,
-                            )
-                            last_command = controller.command(
-                                Detection(visible=False)
-                            )
-                            search_updates += 1
-                        else:
-                            context.scan_view_index = next_index
-                            context.scan_observation_count = 0
-                            context.scan_visible_count = 0
-                            active_view = viewpoint_manager.scan_order[next_index]
-                            last_command = MotionCommand(vx=0.0, vyaw=0.0)
+                    )
+                    if near_field_observations:
+                        detection = near_field_observations[-1].detection
+                        last_detection = detection
+                        active_view = near_field_observations[-1].camera_name
+                    near_field_history = summarize_approach_history(
+                        tuple(context.approach_observations)
+                    )
+                    near_field_result = near_field_verifier.verify(
+                        near_field_evidence,
+                        near_field_history,
+                    )
+                    _transition(
+                        context,
+                        ApproachState.VERIFY,
+                        robot.sim_time,
+                        "near_field_evidence_collected",
+                        transitions,
+                    )
+                    last_command = MotionCommand(vx=0.0, vyaw=0.0)
+                    if near_field_result.success:
+                        context.near_field_success_count += 1
+                        _transition(
+                            context,
+                            ApproachState.SUCCESS,
+                            robot.sim_time,
+                            near_field_result.reason,
+                            transitions,
+                        )
+                        terminal_result = _result(
+                            success=True,
+                            reason=near_field_result.reason,
+                            context=context,
+                            detection=detection,
+                            step_idx=step_idx,
+                            trace=trace,
+                            transitions=transitions,
+                            path_length=path_length,
+                            perception_updates=perception_updates,
+                            total_lost_frames=total_lost_frames,
+                            search_updates=search_updates,
+                            near_field_evidence=near_field_evidence,
+                            near_field_history=near_field_history,
+                        )
+                    elif context.near_field_retry_count < max_near_field_retries:
+                        context.near_field_retry_count += 1
+                        context.near_field_backoff_count += 1
+                        _transition(
+                            context,
+                            ApproachState.RECOVER,
+                            robot.sim_time,
+                            "near_field_verification_failed",
+                            transitions,
+                        )
+                        context.recovery_mode = "near_field_backoff"
+                        context.recovery_steps_remaining = recovery_backoff_steps
+                        last_command = MotionCommand(vx=-backoff_speed, vy=0.0)
                     else:
-                        last_command = MotionCommand(vx=0.0, vyaw=0.0)
+                        context.near_field_retry_exhaustion_count += 1
+                        failure_reason = (
+                            "near_field_unobservable"
+                            if near_field_result.reason == "near_field_unobservable"
+                            else "near_field_verification_failed"
+                        )
+                        _transition(
+                            context,
+                            ApproachState.FAILURE,
+                            robot.sim_time,
+                            failure_reason,
+                            transitions,
+                        )
+                        terminal_result = _result(
+                            success=False,
+                            reason=failure_reason,
+                            context=context,
+                            detection=detection,
+                            step_idx=step_idx,
+                            trace=trace,
+                            transitions=transitions,
+                            path_length=path_length,
+                            perception_updates=perception_updates,
+                            total_lost_frames=total_lost_frames,
+                            search_updates=search_updates,
+                            near_field_evidence=near_field_evidence,
+                            near_field_history=near_field_history,
+                        )
 
                 elif context.state is ApproachState.VERIFY:
                     verification_history.append(_sample(detection))
@@ -497,12 +534,14 @@ def approach_object(
                         camera_name=active_view,
                         visible=detection.visible,
                         center_x=detection.center_x,
+                        center_y=detection.center_y,
                         area_ratio=detection.area_ratio,
+                        touches_bottom=detection.touches_bottom,
                         vx=last_command.vx,
                         vyaw=last_command.vyaw,
                         recovery_count=context.recovery_count,
+                        near_field_retry_count=context.near_field_retry_count,
                         view=active_view,
-                        center_y=detection.center_y,
                     )
                 )
 
@@ -527,6 +566,7 @@ def approach_object(
                 if context.recovery_steps_remaining <= 0:
                     mode = context.recovery_mode
                     context.reset_temporal_history()
+                    context.reset_approach_history()
                     context.reset_progress()
                     context.recovery_mode = None
                     next_state = (
@@ -609,14 +649,15 @@ def _start_camera_scan(
     transitions: list[StateTransition],
     reason: str,
 ) -> str:
-    """Enter CAMERA_SCAN and return the first downward view to render."""
+    """Enter NEAR_FIELD and return the first downward view to render."""
 
     context.reset_scan()
-    scan_order = viewpoint_manager.scan_order
-    context.scan_view_index = 1 if len(scan_order) > 1 else 0
+    scan_order = viewpoint_manager.near_field_order
+    context.scan_view_index = 0
+    context.near_field_entry_count += 1
     _transition(
         context,
-        ApproachState.CAMERA_SCAN,
+        ApproachState.NEAR_FIELD,
         sim_time,
         reason,
         transitions,
@@ -765,6 +806,8 @@ def _result(
     total_lost_frames: int,
     search_updates: int,
     verification: VerificationResult | None = None,
+    near_field_evidence: NearFieldEvidence | None = None,
+    near_field_history: ApproachHistorySummary | None = None,
 ) -> SkillResult:
     evidence: dict[str, object] = {
         "steps": step_idx,
@@ -774,6 +817,13 @@ def _result(
         "path_length": path_length,
         "best_area_ratio": context.best_area_ratio,
         "recovery_count": context.recovery_count,
+        "near_field_entry_count": context.near_field_entry_count,
+        "near_field_success_count": context.near_field_success_count,
+        "near_field_backoff_count": context.near_field_backoff_count,
+        "near_field_retry_exhaustion_count": (
+            context.near_field_retry_exhaustion_count
+        ),
+        "near_field_retry_count": context.near_field_retry_count,
         "final_state": context.state,
         "transitions": tuple(transitions),
     }
@@ -793,6 +843,10 @@ def _result(
         )
     if verification is not None:
         evidence["verification"] = verification.evidence
+    if near_field_evidence is not None:
+        evidence["near_field_evidence"] = near_field_evidence
+    if near_field_history is not None:
+        evidence["approach_history"] = near_field_history
     return SkillResult(
         success=success,
         reason=reason,

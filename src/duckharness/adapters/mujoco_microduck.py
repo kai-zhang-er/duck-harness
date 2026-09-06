@@ -43,6 +43,7 @@ VIRTUAL_CAMERA_PITCHES = {
     "head_forward": 0.0,
     "head_down_20": -math.radians(20.0),
     "head_down_35": -math.radians(35.0),
+    "head_down_60": -math.radians(60.0),
 }
 
 
@@ -225,8 +226,9 @@ class MujocoMicroduckAdapter:
         """Render an RGB frame without advancing physics.
 
         ``head`` and ``head_forward`` are aliases for the default camera.
-        ``head_down_20`` and ``head_down_35`` are virtual views that keep the
-        same head-mounted camera position but tilt its optical axis downward.
+        ``head_down_20``, ``head_down_35``, and ``head_down_60`` are virtual
+        views that keep the same head-mounted camera position but tilt its
+        optical axis downward.
         A concrete MuJoCo camera name is also accepted for simulation-specific
         cameras. Selecting a view never advances physics.
         """

@@ -15,7 +15,9 @@ class ApproachState(Enum):
     SEARCH = auto()
     TRACK = auto()
     APPROACH = auto()
-    CAMERA_SCAN = auto()
+    NEAR_FIELD = auto()
+    # Compatibility alias for V0.8 clients that referred to the scan phase.
+    CAMERA_SCAN = NEAR_FIELD
     VERIFY = auto()
     RECOVER = auto()
     SUCCESS = auto()
@@ -44,6 +46,7 @@ class ApproachContext:
     last_seen_center_x: float | None = None
     last_seen_center_y: float | None = None
     last_seen_area_ratio: float = 0.0
+    last_seen_touches_bottom: bool = False
     best_area_ratio: float = 0.0
     last_progress_step: int = 0
     recovery_mode: str | None = None
@@ -51,6 +54,14 @@ class ApproachContext:
     scan_view_index: int = 0
     scan_observation_count: int = 0
     scan_visible_count: int = 0
+    near_field_retry_count: int = 0
+    near_field_entry_count: int = 0
+    near_field_success_count: int = 0
+    near_field_backoff_count: int = 0
+    near_field_retry_exhaustion_count: int = 0
+    approach_observations: deque[Detection] = field(
+        default_factory=lambda: deque(maxlen=20)
+    )
 
     def observe(self, detection: Detection) -> None:
         """Update temporal visibility/alignment information."""
@@ -63,6 +74,7 @@ class ApproachContext:
             if detection.center_y is not None:
                 self.last_seen_center_y = float(detection.center_y)
             self.last_seen_area_ratio = float(detection.area_ratio)
+            self.last_seen_touches_bottom = detection.touches_bottom
         else:
             self.lost_count += 1
 
@@ -80,6 +92,20 @@ class ApproachContext:
         self.visibility_history.clear()
         self.lost_count = 0
         self.aligned_count = 0
+        self.last_seen_center_x = None
+        self.last_seen_center_y = None
+        self.last_seen_area_ratio = 0.0
+        self.last_seen_touches_bottom = False
+
+    def record_approach(self, detection: Detection) -> None:
+        """Retain recent approach observations for near-field verification."""
+
+        self.approach_observations.append(detection)
+
+    def reset_approach_history(self) -> None:
+        """Discard stale approach observations after a near-field backoff."""
+
+        self.approach_observations.clear()
 
     def reset_scan(self) -> None:
         """Reset the deterministic virtual-camera scan."""

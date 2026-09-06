@@ -11,10 +11,15 @@ from .types import Detection
 class RedBallDetector:
     """Detect the largest sufficiently large red region in an RGB image."""
 
-    def __init__(self, min_area_px: float = 30.0) -> None:
+    def __init__(self, min_area_px: float = 30.0, border_margin: int = 3) -> None:
         if not np.isfinite(min_area_px) or min_area_px <= 0.0:
             raise ValueError("min_area_px must be finite and positive")
+        if isinstance(border_margin, bool) or not isinstance(border_margin, int):
+            raise ValueError("border_margin must be an integer")
+        if border_margin < 0:
+            raise ValueError("border_margin must be non-negative")
         self.min_area_px = float(min_area_px)
+        self.border_margin = border_margin
 
     def detect(self, rgb: np.ndarray) -> Detection:
         """Return the largest red connected component in ``rgb``."""
@@ -52,6 +57,7 @@ class RedBallDetector:
         x, y, box_width, box_height = cv2.boundingRect(contour)
         center_x_px = x + box_width / 2.0
         center_y_px = y + box_height / 2.0
+        margin = self.border_margin
 
         return Detection(
             visible=True,
@@ -60,6 +66,10 @@ class RedBallDetector:
             bbox=(int(x), int(y), int(box_width), int(box_height)),
             area_ratio=(box_width * box_height) / (width * height),
             confidence=1.0,
+            touches_left=x <= margin,
+            touches_right=x + box_width >= width - margin,
+            touches_top=y <= margin,
+            touches_bottom=y + box_height >= height - margin,
         )
 
 

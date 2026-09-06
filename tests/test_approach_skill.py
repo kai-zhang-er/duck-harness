@@ -90,9 +90,9 @@ def test_approach_reaches_target_and_records_trace() -> None:
 
     assert result.success
     assert result.reason == "verified_target_reached"
-    assert result.evidence["steps"] == 11
-    assert result.evidence["perception_updates"] == 12
-    assert len(result.trace) == 12
+    assert result.evidence["steps"] == 8
+    assert result.evidence["perception_updates"] == 9
+    assert len(result.trace) == 9
     assert result.evidence["path_length"] > 0.0
     assert robot.stop_count >= 1
 

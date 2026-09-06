@@ -47,6 +47,18 @@ def test_small_red_region_is_ignored() -> None:
     assert not detection.visible
 
 
+def test_red_ball_border_contacts_are_reported() -> None:
+    image = np.zeros((120, 160, 3), dtype=np.uint8)
+    image[105:120, 70:100] = (255, 0, 0)
+
+    detection = RedBallDetector().detect(image)
+
+    assert detection.visible
+    assert detection.touches_bottom
+    assert not detection.touches_top
+    assert detection.vertical_position_reliable is False
+
+
 def test_draw_detection_does_not_mutate_input() -> None:
     image = np.zeros((120, 160, 3), dtype=np.uint8)
     detection = Detection(

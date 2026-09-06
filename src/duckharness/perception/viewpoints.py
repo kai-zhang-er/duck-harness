@@ -22,10 +22,12 @@ class ViewpointManager:
     FORWARD = "head_forward"
     DOWN_20 = "head_down_20"
     DOWN_35 = "head_down_35"
+    DOWN_60 = "head_down_60"
     DEFAULT_CLOSE_AREA_THRESHOLDS = {
         FORWARD: 0.07,
         DOWN_20: 0.10,
         DOWN_35: 0.12,
+        DOWN_60: 0.12,
     }
 
     def __init__(
@@ -60,11 +62,23 @@ class ViewpointManager:
         self.bottom_threshold = float(bottom_threshold)
         self.bottom_exit_threshold = float(bottom_exit_threshold)
         self.near_area_threshold = float(near_area_threshold)
-        thresholds = close_area_thresholds or self.DEFAULT_CLOSE_AREA_THRESHOLDS
-        expected_views = {self.FORWARD, self.DOWN_20, self.DOWN_35}
+        expected_views = {
+            self.FORWARD,
+            self.DOWN_20,
+            self.DOWN_35,
+            self.DOWN_60,
+        }
+        thresholds = dict(self.DEFAULT_CLOSE_AREA_THRESHOLDS)
+        if close_area_thresholds is not None:
+            unknown_views = set(close_area_thresholds) - expected_views
+            if unknown_views:
+                raise ValueError(
+                    f"unknown close-area viewpoints: {sorted(unknown_views)}"
+                )
+            thresholds.update(close_area_thresholds)
         if set(thresholds) != expected_views:
             raise ValueError(
-                "close_area_thresholds must define forward, down20, and down35 views"
+                "close_area_thresholds must define all four head camera views"
             )
         if any(
             not math.isfinite(value) or value <= 0.0
@@ -79,6 +93,7 @@ class ViewpointManager:
             Viewpoint(self.FORWARD, 0.0),
             Viewpoint(self.DOWN_20, -math.radians(20.0)),
             Viewpoint(self.DOWN_35, -math.radians(35.0)),
+            Viewpoint(self.DOWN_60, -math.radians(60.0)),
         )
 
     @property
@@ -91,7 +106,13 @@ class ViewpointManager:
     def scan_order(self) -> tuple[str, ...]:
         """Return camera names in deterministic scan order."""
 
-        return tuple(view.name for view in self._views)
+        return (self.FORWARD, self.DOWN_20, self.DOWN_35)
+
+    @property
+    def near_field_order(self) -> tuple[str, ...]:
+        """Return downward views used for stationary near-field evidence."""
+
+        return (self.DOWN_20, self.DOWN_35, self.DOWN_60)
 
     def close_area_threshold(
         self,
@@ -135,13 +156,24 @@ class ViewpointManager:
         detection: Detection,
         camera_name: str = FORWARD,
     ) -> bool:
-        """Return whether a visible target should trigger a lower view."""
+        """Return whether a visible target should trigger a lower view.
+
+        A large target, a target at the bottom of the image, or a target
+        touching the bottom border is enough to enter near-field handling.
+        Border contact takes precedence over the centroid because a clipped
+        object's ``center_y`` is not reliable geometry.
+        """
 
         return bool(
             detection.visible
-            and detection.center_y is not None
-            and detection.center_y >= self.bottom_threshold
-            and detection.area_ratio >= self.near_area_threshold
+            and (
+                detection.area_ratio >= self.near_area_threshold
+                or (
+                    detection.center_y is not None
+                    and detection.center_y >= self.bottom_threshold
+                )
+                or detection.touches_bottom
+            )
         )
 
     def is_near_field_loss(
@@ -149,14 +181,20 @@ class ViewpointManager:
         *,
         last_center_y: float | None,
         last_area_ratio: float,
+        last_touches_bottom: bool = False,
         camera_name: str = FORWARD,
     ) -> bool:
         """Classify a loss after a large target was near the image bottom."""
 
         return bool(
-            last_center_y is not None
-            and last_center_y >= self.bottom_threshold
-            and last_area_ratio >= self.near_area_threshold
+            last_touches_bottom
+            or (
+                last_center_y is not None
+                and (
+                    last_area_ratio >= self.near_area_threshold
+                    or last_center_y >= self.bottom_threshold
+                )
+            )
         )
 
     def should_return_forward(self, detection: Detection) -> bool:
@@ -172,7 +210,7 @@ class ViewpointManager:
         """Return whether the current downward view needs a deeper view."""
 
         return bool(
-            camera_name == self.DOWN_20
+            camera_name in {self.DOWN_20, self.DOWN_35}
             and detection.visible
             and detection.center_y is not None
             and detection.center_y >= self.bottom_threshold
@@ -182,4 +220,4 @@ class ViewpointManager:
         """Return the next scan index, or ``None`` when the scan is complete."""
 
         next_index = current_index + 1
-        return next_index if next_index < len(self._views) else None
+        return next_index if next_index < len(self.scan_order) else None
