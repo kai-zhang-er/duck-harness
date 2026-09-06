@@ -83,6 +83,8 @@ def test_near_field_target_is_reacquired_in_downward_view() -> None:
     assert result.reason == "verified_target_reached"
     assert "head_down_20" in robot.cameras
     assert any(entry.state is ApproachState.CAMERA_SCAN for entry in result.trace)
+    assert all(entry.camera_name == entry.view for entry in result.trace)
+    assert any(entry.camera_name == "head_down_20" for entry in result.trace)
     assert any(
         transition.current is ApproachState.CAMERA_SCAN
         for transition in result.evidence["transitions"]

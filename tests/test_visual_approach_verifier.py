@@ -25,6 +25,33 @@ def test_verifier_requires_visible_centered_close_window() -> None:
     assert result.evidence.visible_ratio == 1.0
     assert result.evidence.mean_center_error == pytest.approx(0.046)
     assert result.evidence.area_growth == pytest.approx(0.02)
+    assert result.evidence.mean_area_ratio == pytest.approx(0.152)
+    assert result.evidence.min_area_ratio == pytest.approx(0.14)
+
+
+def test_verifier_can_use_a_view_specific_area_threshold() -> None:
+    verifier = VisualApproachVerifier(stop_area_ratio=0.08)
+    history = [VerificationSample(True, 0.02, 0.105)] * 5
+
+    result = verifier.verify(history, stop_area_ratio=0.10)
+
+    assert result.success
+    assert result.evidence.mean_area_ratio == pytest.approx(0.105)
+
+
+def test_verifier_uses_mean_area_over_single_last_frame() -> None:
+    verifier = VisualApproachVerifier(stop_area_ratio=0.10)
+    history = [
+        VerificationSample(True, 0.02, 0.12),
+        VerificationSample(True, 0.02, 0.12),
+        VerificationSample(True, 0.02, 0.08),
+        VerificationSample(True, 0.02, 0.12),
+        VerificationSample(True, 0.02, 0.12),
+    ]
+
+    result = verifier.verify(history)
+
+    assert result.success
 
 
 def test_verifier_rejects_transient_dropout() -> None:

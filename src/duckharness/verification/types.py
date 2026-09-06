@@ -24,6 +24,8 @@ class ApproachEvidence:
     area_end: float
     area_growth: float
     max_area: float
+    mean_area_ratio: float
+    min_area_ratio: float
 
 
 @dataclass(frozen=True)

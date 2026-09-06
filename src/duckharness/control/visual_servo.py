@@ -77,22 +77,32 @@ class VisualServoController:
         self.yaw_sign = float(yaw_sign)
         self.min_align_yaw_rate = float(min_align_yaw_rate)
 
-    def phase(self, detection: Detection) -> ServoPhase:
+    def phase(
+        self,
+        detection: Detection,
+        *,
+        stop_area_ratio: float | None = None,
+    ) -> ServoPhase:
         """Return the phase implied by one detection."""
 
         if not detection.visible or detection.center_x is None:
             return ServoPhase.SEARCH
         center_x = _clamp(float(detection.center_x), -1.0, 1.0)
-        if self.reached_target(detection):
+        if self.reached_target(detection, stop_area_ratio=stop_area_ratio):
             return ServoPhase.STOP
         if abs(center_x) > self.centered_threshold:
             return ServoPhase.ALIGN
         return ServoPhase.APPROACH
 
-    def command(self, detection: Detection) -> MotionCommand:
+    def command(
+        self,
+        detection: Detection,
+        *,
+        stop_area_ratio: float | None = None,
+    ) -> MotionCommand:
         """Compute a bounded command from the latest visual detection."""
 
-        phase = self.phase(detection)
+        phase = self.phase(detection, stop_area_ratio=stop_area_ratio)
         if phase is ServoPhase.SEARCH:
             return MotionCommand(vx=0.0, vyaw=self.search_yaw_rate)
         if phase is ServoPhase.STOP:
@@ -118,13 +128,22 @@ class VisualServoController:
             vyaw=yaw_cmd,
         )
 
-    def reached_target(self, detection: Detection) -> bool:
+    def reached_target(
+        self,
+        detection: Detection,
+        *,
+        stop_area_ratio: float | None = None,
+    ) -> bool:
         """Return whether the target is visually close and centered."""
 
+        area_threshold = self.stop_area_ratio
+        if stop_area_ratio is not None:
+            _positive(stop_area_ratio, "stop_area_ratio")
+            area_threshold = float(stop_area_ratio)
         return bool(
             detection.visible
             and detection.center_x is not None
-            and detection.area_ratio >= self.stop_area_ratio
+            and detection.area_ratio >= area_threshold
             and abs(float(detection.center_x)) <= self.stop_center_threshold
         )
 

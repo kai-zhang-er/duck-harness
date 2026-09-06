@@ -34,6 +34,7 @@ class ApproachTraceEntry:
 
     sim_time: float
     state: ApproachState
+    camera_name: str
     visible: bool
     center_x: float | None
     area_ratio: float
@@ -189,24 +190,38 @@ def approach_object(
 
                 elif context.state is ApproachState.TRACK:
                     if context.lost_count >= max_lost_frames:
-                        terminal_result, last_command = _begin_recovery(
-                            context=context,
-                            mode="target_lost",
-                            controller=controller,
-                            recovery_yaw_rate=recovery_yaw_rate,
-                            recovery_turn_steps=recovery_turn_steps,
-                            recovery_backoff_steps=recovery_backoff_steps,
-                            backoff_speed=backoff_speed,
-                            max_retries=max_retries,
-                            sim_time=robot.sim_time,
-                            transitions=transitions,
-                            detection=detection,
-                            step_idx=step_idx,
-                            path_length=path_length,
-                            perception_updates=perception_updates,
-                            total_lost_frames=total_lost_frames,
-                            search_updates=search_updates,
-                        )
+                        if viewpoint_manager.is_near_field_loss(
+                            last_center_y=context.last_seen_center_y,
+                            last_area_ratio=context.last_seen_area_ratio,
+                            camera_name=active_view,
+                        ):
+                            active_view = _start_camera_scan(
+                                context=context,
+                                viewpoint_manager=viewpoint_manager,
+                                sim_time=robot.sim_time,
+                                transitions=transitions,
+                                reason="target_lost_near",
+                            )
+                            last_command = MotionCommand(vx=0.0, vyaw=0.0)
+                        else:
+                            terminal_result, last_command = _begin_recovery(
+                                context=context,
+                                mode="target_lost_far",
+                                controller=controller,
+                                recovery_yaw_rate=recovery_yaw_rate,
+                                recovery_turn_steps=recovery_turn_steps,
+                                recovery_backoff_steps=recovery_backoff_steps,
+                                backoff_speed=backoff_speed,
+                                max_retries=max_retries,
+                                sim_time=robot.sim_time,
+                                transitions=transitions,
+                                detection=detection,
+                                step_idx=step_idx,
+                                path_length=path_length,
+                                perception_updates=perception_updates,
+                                total_lost_frames=total_lost_frames,
+                                search_updates=search_updates,
+                            )
                     elif detection.visible and detection.center_x is not None:
                         if (
                             abs(float(detection.center_x))
@@ -236,6 +251,7 @@ def approach_object(
                         and viewpoint_manager.is_near_field_loss(
                             last_center_y=context.last_seen_center_y,
                             last_area_ratio=context.last_seen_area_ratio,
+                            camera_name=active_view,
                         )
                     ):
                         active_view = _start_camera_scan(
@@ -243,12 +259,15 @@ def approach_object(
                             viewpoint_manager=viewpoint_manager,
                             sim_time=robot.sim_time,
                             transitions=transitions,
-                            reason="near_field_target_lost",
+                            reason="target_lost_near",
                         )
                         last_command = MotionCommand(vx=0.0, vyaw=0.0)
                     elif (
                         detection.visible
-                        and viewpoint_manager.is_near_field(detection)
+                        and viewpoint_manager.is_near_field(
+                            detection,
+                            camera_name=active_view,
+                        )
                     ):
                         active_view = _start_camera_scan(
                             context=context,
@@ -261,7 +280,7 @@ def approach_object(
                     elif context.lost_count >= max_lost_frames:
                         terminal_result, last_command = _begin_recovery(
                             context=context,
-                            mode="target_lost",
+                            mode="target_lost_far",
                             controller=controller,
                             recovery_yaw_rate=recovery_yaw_rate,
                             recovery_turn_steps=recovery_turn_steps,
@@ -278,8 +297,12 @@ def approach_object(
                             search_updates=search_updates,
                         )
                     elif (
-                        detection.visible
-                        and detection.area_ratio >= controller.stop_area_ratio
+                        viewpoint_manager.is_near_target(
+                            detection,
+                            camera_name=active_view,
+                            minimum_area_ratio=controller.stop_area_ratio,
+                            max_center_error=controller.stop_center_threshold,
+                        )
                     ):
                         verification_history = [_sample(detection)]
                         _transition(
@@ -315,7 +338,12 @@ def approach_object(
                             search_updates=search_updates,
                         )
                     else:
-                        last_command = controller.command(detection)
+                        last_command = _view_command(
+                            controller,
+                            detection,
+                            viewpoint_manager,
+                            active_view,
+                        )
 
                 elif context.state is ApproachState.CAMERA_SCAN:
                     context.scan_observation_count += 1
@@ -325,7 +353,12 @@ def approach_object(
                         context.scan_visible_count = 0
 
                     if context.scan_visible_count >= camera_scan_confirmations:
-                        if detection.area_ratio >= controller.stop_area_ratio:
+                        if viewpoint_manager.is_near_target(
+                            detection,
+                            camera_name=active_view,
+                            minimum_area_ratio=controller.stop_area_ratio,
+                            max_center_error=controller.stop_center_threshold,
+                        ):
                             verification_history = [_sample(detection)]
                             _transition(
                                 context,
@@ -335,6 +368,33 @@ def approach_object(
                                 transitions,
                             )
                             last_command = MotionCommand(vx=0.0, vyaw=0.0)
+                        elif viewpoint_manager.should_descend(
+                            detection,
+                            active_view,
+                        ):
+                            next_index = viewpoint_manager.next_view_index(
+                                context.scan_view_index
+                            )
+                            if next_index is not None:
+                                context.scan_view_index = next_index
+                                context.scan_observation_count = 0
+                                context.scan_visible_count = 0
+                                active_view = viewpoint_manager.scan_order[next_index]
+                                last_command = MotionCommand(vx=0.0, vyaw=0.0)
+                            else:
+                                last_command = _track_command(controller, detection)
+                        elif viewpoint_manager.should_return_forward(detection):
+                            context.reset_scan()
+                            active_view = viewpoint_manager.FORWARD
+                            _transition(
+                                context,
+                                ApproachState.TRACK,
+                                robot.sim_time,
+                                "camera_hysteresis_return_forward",
+                                transitions,
+                            )
+                            context.aligned_count = 0
+                            last_command = _track_command(controller, detection)
                         else:
                             _transition(
                                 context,
@@ -380,7 +440,13 @@ def approach_object(
                     verification_history.append(_sample(detection))
                     last_command = MotionCommand(vx=0.0, vyaw=0.0)
                     if len(verification_history) >= verify_observations:
-                        verification = verifier.verify(verification_history)
+                        verification = verifier.verify(
+                            verification_history,
+                            stop_area_ratio=viewpoint_manager.close_area_threshold(
+                                active_view,
+                                minimum_area_ratio=controller.stop_area_ratio,
+                            ),
+                        )
                         if verification.success:
                             _transition(
                                 context,
@@ -428,6 +494,7 @@ def approach_object(
                     ApproachTraceEntry(
                         sim_time=robot.sim_time,
                         state=context.state,
+                        camera_name=active_view,
                         visible=detection.visible,
                         center_x=detection.center_x,
                         area_ratio=detection.area_ratio,
@@ -464,7 +531,7 @@ def approach_object(
                     context.recovery_mode = None
                     next_state = (
                         ApproachState.SEARCH
-                        if mode == "target_lost"
+                        if mode in {"target_lost", "target_lost_far"}
                         else ApproachState.TRACK
                     )
                     _transition(
@@ -604,7 +671,7 @@ def _begin_recovery(
 
     _transition(context, ApproachState.RECOVER, sim_time, mode, transitions)
     context.recovery_mode = mode
-    if mode == "target_lost":
+    if mode in {"target_lost", "target_lost_far"}:
         direction = _recovery_yaw_direction(controller, context.last_seen_center_x)
         rate = min(recovery_yaw_rate, controller.max_yaw_rate)
         command = MotionCommand(vx=0.0, vyaw=direction * rate)
@@ -637,6 +704,23 @@ def _track_command(
 ) -> MotionCommand:
     command = controller.command(detection)
     return MotionCommand(vx=0.0, vy=0.0, vyaw=command.vyaw)
+
+
+def _view_command(
+    controller: VisualServoController,
+    detection: Detection,
+    viewpoint_manager: ViewpointManager,
+    camera_name: str,
+) -> MotionCommand:
+    """Command locomotion using the close threshold for the active view."""
+
+    return controller.command(
+        detection,
+        stop_area_ratio=viewpoint_manager.close_area_threshold(
+            camera_name,
+            minimum_area_ratio=controller.stop_area_ratio,
+        ),
+    )
 
 
 def _sample(detection: Detection) -> VerificationSample:

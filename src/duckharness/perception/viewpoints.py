@@ -22,16 +22,32 @@ class ViewpointManager:
     FORWARD = "head_forward"
     DOWN_20 = "head_down_20"
     DOWN_35 = "head_down_35"
+    DEFAULT_CLOSE_AREA_THRESHOLDS = {
+        FORWARD: 0.07,
+        DOWN_20: 0.10,
+        DOWN_35: 0.12,
+    }
 
     def __init__(
         self,
         *,
-        bottom_threshold: float = 0.65,
+        bottom_threshold: float = 0.60,
+        bottom_exit_threshold: float = 0.35,
         near_area_threshold: float = 0.05,
+        close_area_thresholds: dict[str, float] | None = None,
         scan_dwell_observations: int = 2,
     ) -> None:
         if not math.isfinite(bottom_threshold) or not -1.0 <= bottom_threshold <= 1.0:
             raise ValueError("bottom_threshold must be within [-1, 1]")
+        if (
+            not math.isfinite(bottom_exit_threshold)
+            or not -1.0 <= bottom_exit_threshold <= 1.0
+        ):
+            raise ValueError("bottom_exit_threshold must be within [-1, 1]")
+        if bottom_exit_threshold >= bottom_threshold:
+            raise ValueError(
+                "bottom_exit_threshold must be less than bottom_threshold"
+            )
         if not math.isfinite(near_area_threshold) or near_area_threshold < 0.0:
             raise ValueError("near_area_threshold must be non-negative")
         if (
@@ -42,7 +58,22 @@ class ViewpointManager:
             raise ValueError("scan_dwell_observations must be positive")
 
         self.bottom_threshold = float(bottom_threshold)
+        self.bottom_exit_threshold = float(bottom_exit_threshold)
         self.near_area_threshold = float(near_area_threshold)
+        thresholds = close_area_thresholds or self.DEFAULT_CLOSE_AREA_THRESHOLDS
+        expected_views = {self.FORWARD, self.DOWN_20, self.DOWN_35}
+        if set(thresholds) != expected_views:
+            raise ValueError(
+                "close_area_thresholds must define forward, down20, and down35 views"
+            )
+        if any(
+            not math.isfinite(value) or value <= 0.0
+            for value in thresholds.values()
+        ):
+            raise ValueError("close area thresholds must be finite and positive")
+        self._close_area_thresholds = {
+            name: float(value) for name, value in thresholds.items()
+        }
         self.scan_dwell_observations = scan_dwell_observations
         self._views = (
             Viewpoint(self.FORWARD, 0.0),
@@ -62,8 +93,49 @@ class ViewpointManager:
 
         return tuple(view.name for view in self._views)
 
-    def is_near_field(self, detection: Detection) -> bool:
-        """Return whether a visible target is near the bottom of the image."""
+    def close_area_threshold(
+        self,
+        camera_name: str,
+        *,
+        minimum_area_ratio: float = 0.0,
+    ) -> float:
+        """Return the effective close threshold for a selected camera view."""
+
+        if camera_name not in self._close_area_thresholds:
+            raise ValueError(f"unknown viewpoint {camera_name!r}")
+        if not math.isfinite(minimum_area_ratio) or minimum_area_ratio < 0.0:
+            raise ValueError("minimum_area_ratio must be finite and non-negative")
+        return max(self._close_area_thresholds[camera_name], minimum_area_ratio)
+
+    def is_near_target(
+        self,
+        detection: Detection,
+        camera_name: str = FORWARD,
+        *,
+        minimum_area_ratio: float = 0.0,
+        max_center_error: float = 0.20,
+    ) -> bool:
+        """Return whether a target is close and horizontally aligned."""
+
+        if not math.isfinite(max_center_error) or max_center_error <= 0.0:
+            raise ValueError("max_center_error must be finite and positive")
+        return bool(
+            detection.visible
+            and detection.center_x is not None
+            and abs(float(detection.center_x)) <= max_center_error
+            and detection.area_ratio
+            >= self.close_area_threshold(
+                camera_name,
+                minimum_area_ratio=minimum_area_ratio,
+            )
+        )
+
+    def is_near_field(
+        self,
+        detection: Detection,
+        camera_name: str = FORWARD,
+    ) -> bool:
+        """Return whether a visible target should trigger a lower view."""
 
         return bool(
             detection.visible
@@ -77,6 +149,7 @@ class ViewpointManager:
         *,
         last_center_y: float | None,
         last_area_ratio: float,
+        camera_name: str = FORWARD,
     ) -> bool:
         """Classify a loss after a large target was near the image bottom."""
 
@@ -84,6 +157,25 @@ class ViewpointManager:
             last_center_y is not None
             and last_center_y >= self.bottom_threshold
             and last_area_ratio >= self.near_area_threshold
+        )
+
+    def should_return_forward(self, detection: Detection) -> bool:
+        """Return whether a downward view has enough margin to return forward."""
+
+        return bool(
+            detection.visible
+            and detection.center_y is not None
+            and detection.center_y <= self.bottom_exit_threshold
+        )
+
+    def should_descend(self, detection: Detection, camera_name: str) -> bool:
+        """Return whether the current downward view needs a deeper view."""
+
+        return bool(
+            camera_name == self.DOWN_20
+            and detection.visible
+            and detection.center_y is not None
+            and detection.center_y >= self.bottom_threshold
         )
 
     def next_view_index(self, current_index: int) -> int | None:

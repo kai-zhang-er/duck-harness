@@ -32,8 +32,15 @@ class VisualApproachVerifier:
     def verify(
         self,
         history: Sequence[VerificationSample],
+        *,
+        stop_area_ratio: float | None = None,
     ) -> VerificationResult:
         """Evaluate visibility, centering, size, and recent area trend."""
+
+        threshold = self.stop_area_ratio
+        if stop_area_ratio is not None:
+            _positive(stop_area_ratio, "stop_area_ratio")
+            threshold = float(stop_area_ratio)
 
         if not history:
             return VerificationResult(
@@ -48,7 +55,7 @@ class VisualApproachVerifier:
             return VerificationResult(False, "verification_target_not_visible", evidence)
         if not visible or evidence.mean_center_error > self.max_center_error:
             return VerificationResult(False, "verification_target_off_center", evidence)
-        if evidence.area_end < self.stop_area_ratio:
+        if evidence.mean_area_ratio < threshold:
             return VerificationResult(False, "verification_target_not_close", evidence)
         if evidence.area_growth < self.min_area_growth:
             return VerificationResult(False, "verification_moving_away", evidence)
@@ -57,7 +64,7 @@ class VisualApproachVerifier:
 
 def _evidence(history: Sequence[VerificationSample]) -> ApproachEvidence:
     if not history:
-        return ApproachEvidence(0.0, math.inf, 0.0, 0.0, 0.0, 0.0)
+        return ApproachEvidence(0.0, math.inf, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     visible = [sample for sample in history if sample.visible]
     areas = [sample.area_ratio for sample in visible]
     center_errors = [
@@ -67,6 +74,7 @@ def _evidence(history: Sequence[VerificationSample]) -> ApproachEvidence:
     ]
     area_start = areas[0] if areas else 0.0
     area_end = areas[-1] if areas else 0.0
+    mean_area_ratio = sum(areas) / len(areas) if areas else 0.0
     return ApproachEvidence(
         visible_ratio=len(visible) / len(history),
         mean_center_error=(sum(center_errors) / len(center_errors))
@@ -76,6 +84,8 @@ def _evidence(history: Sequence[VerificationSample]) -> ApproachEvidence:
         area_end=area_end,
         area_growth=area_end - area_start,
         max_area=max(areas, default=0.0),
+        mean_area_ratio=mean_area_ratio,
+        min_area_ratio=min(areas, default=0.0),
     )
 
 
